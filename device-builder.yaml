@@ -1,0 +1,50 @@
+# wM-Bus electricity meter -> Home Assistant, for the ESPHome Device Builder.
+#
+# Paste this file into a new device in the ESPHome Device Builder (Home Assistant
+# add-on). It loads the firmware from GitHub, so you need no other files. Add the
+# keys from secrets.yaml.example to the Device Builder's secrets. docs/setup.md
+# walks through it. Settings below are the same as in wmbus.yaml.
+
+substitutions:
+  # --- Device --------------------------------------------------------------
+  device_name: wmbus              # hostname, reachable as wmbus.local
+  friendly_name: wM-Bus Meter     # device name in Home Assistant; the entity IDs
+                                  # in recipes/ assume this name
+  # Radio (link-layer) address of your meter, from secrets.yaml. It is not the
+  # serial on the meter label; docs/setup.md, step 3, shows how to find it.
+  meter_id_str: !secret meter_address
+  log_level: INFO                 # WARN, INFO or DEBUG. DEBUG while you look for the meter's radio
+                                  # address (docs/setup.md, step 3), then back to INFO
+
+  # --- Wi-Fi ---------------------------------------------------------------
+  wifi_power_save: HIGH           # saves 10-30 mA; LIGHT if Home Assistant reacts slowly
+  wifi_output_power: 11dB         # raise it if "WiFi Signal" drops below about -75 dBm
+
+  # --- Display and LED -----------------------------------------------------
+  # Brightness from 0.0 to 1.0. Night is the time between night_start and
+  # night_end (full hours, Home Assistant time): the idle display is off then.
+  night_start: "21"
+  night_end: "7"
+  display_dim: "0.15"             # idle main page by day (0.15 reads through the case cover)
+  display_bright_day: "0.60"      # after a PRG press, by day
+  display_bright_night: "0.15"    # after a PRG press, at night
+  display_bright_time: 30s        # how long a PRG press keeps the display bright (seconds: 5s-300s)
+  led_day: "0.60"                 # white LED blip per telegram, by day
+  led_night: "0.10"               # white LED blip per telegram, at night
+
+  # --- Load chart ----------------------------------------------------------
+  chart_max_default: "2.5"        # kW at full bar length after the first flash;
+                                  # change it later with "Chart max" in Home Assistant
+
+packages:
+  wmbus_listener:
+    url: https://github.com/grinser/esphome-wmbus-listener
+    ref: stable                   # the latest release; main is development
+    refresh: 1d
+    files:
+      - packages/device.yaml      # board, Wi-Fi, API, OTA, clock
+      - packages/meter.yaml       # radio, meter decoder, meter sensors, LED
+      - packages/display.yaml     # OLED pages, brightness, PRG button
+      - packages/load_chart.yaml  # daily kWh and the two load charts
+      - packages/power.yaml       # battery, low-battery cutoff, power off
+      - packages/bluetooth.yaml   # optional Bluetooth proxy (off by default)

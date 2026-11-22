@@ -1,0 +1,223 @@
+# Battery level, charge detection, low-battery cutoff and power off.
+
+# Not a user setting: 3.4 V protects the LiPo cell and is 0 % on the battery
+# level curve below, so the two must change together. A config that still
+# sets battery_cutoff in its substitutions overrides this default.
+substitutions:
+  battery_cutoff: "3.4"
+
+# "Power off" = indefinite deep sleep (the board has no real power switch).
+# Entered only on demand via the power_off script (PRG long-press / low battery);
+# there is no run/sleep cycle. The PRG button (low) wakes the chip back up.
+deep_sleep:
+  id: off_mode
+  wakeup_pin:
+    number: GPIO0
+    inverted: true              # wake on LOW = PRG pressed
+    allow_other_uses: true      # GPIO0 is also the page/wake button while running
+    ignore_strapping_warning: true
+  wakeup_pin_mode: KEEP_AWAKE   # if PRG is somehow still held, wait instead of insta-waking
+
+globals:
+  # --- Battery charge detection (see edge detector + charging_splash) -------
+  - id: vbat_prev             # previous voltage sample — for the plug-in edge detector
+    type: float               # (the one reliable charge signal: the +127 mV IR step)
+    restore_value: false
+    initial_value: '0'
+
+  - id: low_batt_latched      # low-battery cutoff latch: once a real low is seen it
+    type: bool                # stays set, so a fast collapse can't escape the cutoff
+    restore_value: false
+    initial_value: 'false'
+
+  - id: charging_flag         # best-effort "charging" for HA: set on a detected plug-in,
+    type: bool                # auto-cleared after a timeout (can't detect unplug)
+    restore_value: false
+    initial_value: 'false'
+
+switch:
+  # ADC_Ctrl (GPIO37): connect the VBAT divider (390k/100k) to GPIO1. Driven HIGH
+  # here (LOW gave 0.00 V on this board); ~9 µA through the divider, so holding it
+  # on continuously is negligible.
+  - platform: gpio
+    id: adc_ctrl
+    pin:
+      number: GPIO37
+    restore_mode: ALWAYS_ON
+    internal: true
+
+script:
+  # Charging splash: a detected plug-in (the +127 mV step, in battery_voltage
+  # on_value) shows a full-screen bolt for 6 s, then returns to idle. Brightness
+  # matches an interaction: low at night, regular by day (won't blast the room at
+  # 3am). display_awake is held so the 60 s idle re-assert can't yank the page
+  # mid-splash. Also raises the best-effort HA "Charging" flag + (re)arms its clear.
+  # mode: restart = a second plug-in just restarts it.
+  - id: charging_splash
+    mode: restart
+    then:
+      - lambda: 'id(charging_flag) = true;'
+      - script.execute: charging_clear
+      - display.page.show: page_charging
+      - lambda: |-
+          auto now = id(ha_time).now();
+          bool night = now.is_valid() && is_night_hour(now.hour, id(night_start_h).state, id(night_end_h).state);
+          id(display_awake) = true;
+          id(oled).set_contrast((night ? id(display_bright_night_pct).state : id(display_bright_day_pct).state) / 100.0f);
+          id(oled).turn_on();
+      - component.update: oled
+      - delay: 6s
+      - lambda: 'id(display_awake) = false;'
+      - script.execute: idle_display
+
+  # Best-effort "Charging" auto-clear: we can detect plug-in but not unplug, so the
+  # HA flag clears 2.5 h after the last plug-in (longer than a full charge). Restarted
+  # on each plug-in. If you unplug early, HA shows charging until this fires — by design.
+  - id: charging_clear
+    mode: restart
+    then:
+      - delay: 2.5h
+      - lambda: 'id(charging_flag) = false;'
+
+  # "Power off": park everything, then sleep until PRG (or RST) is pressed.
+  # Standby draw is tens of uA - months on a LiPo; battery self-discharge
+  # dominates. USB charging keeps working while off (the charger IC is
+  # independent of the ESP32).
+  - id: power_off
+    mode: single
+    then:
+      - logger.log:
+          format: "Powering off (PRG long-press or low battery) - press PRG to power on"
+          level: WARN
+      - lambda: |-
+          id(display_awake) = false;
+          id(oled).turn_off();
+      - switch.turn_off: vext_power   # OLED rail off
+      - switch.turn_off: adc_ctrl     # VBAT divider off
+      - delay: 100ms                  # let the log line drain
+      - lambda: wmbus_hold_pins_for_off();  # incl. SX1262 reset, else it RXes at ~5 mA
+      - deep_sleep.enter: off_mode
+
+# Low-battery cutoff: power off near depletion instead of browning out / over-
+# discharging the LiPo. Checked on a timer so it re-evaluates the smoothed median.
+#   - 90 s boot grace: lets the median window fill, so a noisy cold-start reading
+#     (or a transient on a fresh wake) can't power us straight back off.
+#   - Trips at battery_cutoff (3.4 V) — the LiPo knee under
+#     our ~57 mA average load (and the %-map 0% point),
+#     leaving margin above the regulator brown-out and sparing deep-discharge wear.
+#   - 2.5 V floor excludes a stray/absent-battery reading (USB-only); a real LiPo
+#     low sits between 2.5 V and the cutoff.
+#   - Latches: once a real low is seen the latch holds, so a fast collapse below the
+#     floor between checks can't escape the cutoff. Reset on reboot (after a charge).
+# Note: trips before the v<=3.2 USB-only zone, so a discharging pack never lingers
+# in the range where that zone would mis-flag it as "on USB".
+interval:
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (millis() < 90000) return false;          // boot grace period
+              float v = id(battery_voltage).state;
+              if (isnan(v)) return false;
+              if (v > 2.5f && v < ${battery_cutoff}f) id(low_batt_latched) = true;
+              return id(low_batt_latched);
+          then:
+            - script.execute: power_off
+
+binary_sensor:
+  # Best-effort "Charging" for HA. We can only reliably detect the plug-in event
+  # (the +127 mV step), not unplug — so this goes true on a detected plug-in and
+  # auto-clears 2.5 h later (see charging_clear). Right after plugging in it's
+  # correct; unplug early and it stays on until the timeout. Best-effort by design.
+  - platform: template
+    id: charging
+    name: "Charging"
+    device_class: battery_charging
+    lambda: 'return id(charging_flag);'
+
+sensor:
+  # Battery voltage on GPIO1 (divider gated by adc_ctrl/GPIO37). The 4.9 factor is
+  # the resistor-divider math ((390k+100k)/100k); if it reads a bit off, calibrate it
+  # against a multimeter (adjust `multiply`, or swap to a calibrate_linear filter).
+  # Only meaningful with a LiPo attached — on USB-only it may read 0 / a stray value.
+  - platform: adc
+    pin: GPIO1
+    id: battery_voltage
+    name: "Battery Voltage"
+    # 2.5db (linear ~0.1-1.25 V), not 12db: the 390k/100k divider puts 4.2 V ->
+    # ~0.86 V at the pin, so 12db wasted ~3/4 of the ADC range (hence the coarse
+    # ~5 mV steps). 2.5db keeps the 0.71-0.86 V signal well inside range (~0.4 V
+    # headroom, no LiPo clip risk) and shrinks the LSB from ~4.7 mV to ~1.8 mV at
+    # the battery. Small absolute recal shift vs 12db — fine, the %-map is rebuilt
+    # on this scale anyway.
+    attenuation: 2.5db
+    # 5 s sampling (~ our-meter telegram cadence). ADC cost is negligible: the
+    # divider current (~9 uA via adc_ctrl) is always-on regardless of rate, and a
+    # conversion is microseconds on a CPU already awake for Wi-Fi/radio. Faster
+    # sampling exists to detect plug-in quickly, not to draw more power.
+    update_interval: 5s
+    # Oversample each publish: 32 back-to-back ADC reads, averaged. Cuts ADC
+    # white noise (the 80k-source divider is noisy) before the median sees it.
+    # These reads complete in <1 ms, so this averages ADC noise but not the slower
+    # Wi-Fi/radio load transients; the median filter below handles single spikes.
+    samples: 32
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    filters:
+      - multiply: 4.9           # resistor-divider math: (390k+100k)/100k
+      # 3-sample median: rejects single-sample ADC spikes (the common case) while
+      # staying responsive (~15 s window at 5 s sampling) so the edge detector
+      # below sees a real step within ~10 s. The low-battery cutoff's 90 s boot
+      # grace still guards against acting on a noisy cold-start reading.
+      - median:
+          window_size: 3
+          send_every: 1
+          send_first_at: 1
+    # Charge detection — minimal by design. The board has no VBUS/CHRG pin, and we
+    # proved that inferring a persistent charge state from voltage alone is
+    # unreliable (stepless unplug-from-full + false flips on the discharge curve).
+    # So detect only the one bulletproof event — the plug-in IR step (+127 mV
+    # measured, >20x the ~5 mV oversampled noise) — and fire a brief "charging"
+    # splash. No persistent bolt, no unplug detection, no state machine. The CC
+    # charge rise afterwards is gradual (<50 mV/sample) so it won't re-trigger.
+    on_value:
+      - lambda: |-
+          float v = x;
+          if (isnan(v)) return;
+          float p = id(vbat_prev);
+          id(vbat_prev) = v;
+          if (p > 0.0f && (v - p) >= 0.05f) id(charging_splash).execute();
+
+  # LiPo % — piecewise V->SoC fit so the number tracks remaining runtime, not raw
+  # voltage. Under our ~constant device load, elapsed discharge time is proportional
+  # to charge consumed, so SoC = (total - elapsed) / total. Breakpoints derive from a
+  # full continuous discharge captured 2026-06-17 (4.06 V -> 3.41 V cutoff over
+  # 1154 min):
+  #   4.05=100  3.95=89  3.85=73  3.75=57  3.65=47  3.55=25  3.50=13  3.45=5  3.40=0
+  # >=4.05 V reads a steady 100% (covers the 4.05-4.14 V full plateau, no flicker).
+  # Below the 3.55 V knee, ~13 % of capacity lives between 3.50 V and the cutoff,
+  # as a steady slope (not a cliff). 0 % == the cutoff.
+  - platform: template
+    id: battery_level
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    device_class: battery
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      float v = id(battery_voltage).state;
+      if (isnan(v)) return NAN;
+      static const float bv[] = {4.05f, 3.95f, 3.85f, 3.75f, 3.65f, 3.55f, 3.50f, 3.45f, 3.40f};
+      static const float bp[] = {100.0f, 89.0f, 73.0f, 57.0f, 47.0f, 25.0f, 13.0f, 5.0f, 0.0f};
+      const int n = sizeof(bv) / sizeof(bv[0]);
+      if (v >= bv[0]) return 100.0f;
+      for (int i = 1; i < n; i++) {
+        if (v >= bv[i]) {
+          float f = (v - bv[i]) / (bv[i-1] - bv[i]);
+          return bp[i] + f * (bp[i-1] - bp[i]);
+        }
+      }
+      return 0.0f;

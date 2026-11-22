@@ -1,0 +1,31 @@
+# Optional Bluetooth proxy for Home Assistant, off by default.
+
+# BLE is compiled in but OFF at boot; the "Bluetooth Proxy" switch enables it at
+# runtime. Shares the 2.4 GHz radio with Wi-Fi (esp-idf coexistence handles it);
+# the SX1262 wM-Bus radio is separate 868 MHz SPI, so meter RX is unaffected.
+# Active scanning = more coverage but continuous RX, so keep it off unless needed.
+esp32_ble:
+  enable_on_boot: false
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+bluetooth_proxy:
+  active: true                  # allow HA to make GATT connections through the proxy
+
+switch:
+  # Toggle the Bluetooth proxy from HA. BLE is compiled in but OFF at boot
+  # (esp32_ble: enable_on_boot: false); this switch enables/disables the radio at
+  # runtime. ALWAYS_OFF so a reboot never silently leaves BLE draining the battery —
+  # flip it on only when you need the bridge (active scanning adds tens of mA).
+  - platform: template
+    name: "Bluetooth Proxy"
+    id: ble_proxy_switch
+    icon: "mdi:bluetooth"
+    optimistic: true            # no state callback from enable/disable; reflect command
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - ble.enable:
+    turn_off_action:
+      - ble.disable:

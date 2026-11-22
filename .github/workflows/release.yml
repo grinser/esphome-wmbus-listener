@@ -1,0 +1,126 @@
+name: Firmware release
+
+# Builds the factory firmware (wmbus.factory.yaml) for the web installer.
+# Pull requests: build only. Published release: attach the files to the release
+# and publish the installer page (static/) with the firmware to GitHub Pages.
+on:
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - wmbus.factory.yaml
+      - wmbus.yaml
+      - packages/**
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.build.outputs.name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      # The packages read secrets.yaml. The factory firmware removes Wi-Fi and
+      # API key; the meter address is "00000000" until set_meter runs.
+      - name: Placeholder secrets
+        run: |
+          key=$(python3 -c 'import secrets,base64;print(base64.b64encode(secrets.token_bytes(32)).decode())')
+          sed "s|REPLACE_WITH_GENERATED_BASE64_KEY=|$key|" secrets.yaml.example > secrets.yaml
+      - name: Set the release version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${TAG#v}"
+          case "$version" in *[!0-9A-Za-z.+-]*) echo "::error::Unexpected tag $TAG"; exit 1 ;; esac
+          sed -i "s/version: dev /version: \"$version\" /" wmbus.factory.yaml
+          grep -n "version:" wmbus.factory.yaml
+      - name: Build
+        id: build
+        uses: esphome/build-action@ae5408cdbc4f70692bf8e345c4982bca05a93667  # v8.1.0
+        with:
+          yaml-file: wmbus.factory.yaml
+          version: 2026.11.0
+          complete-manifest: true
+          release-summary: ${{ github.event.release.name }}
+          release-url: ${{ github.event.release.html_url }}
+      - name: Show the files
+        env:
+          NAME: ${{ steps.build.outputs.name }}
+        run: |
+          ls -l "$NAME"
+          cat "$NAME/manifest.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: firmware
+          path: ${{ steps.build.outputs.name }}
+
+  # Pre-releases get no files and no Pages update: every board's update entity
+  # reads the Pages manifest, so only full releases may reach it.
+  attach:
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: firmware
+          path: firmware
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" firmware/*.bin firmware/manifest.json --repo "$GITHUB_REPOSITORY" --clobber
+
+  # Device Builder users load device-builder.yaml from the stable branch.
+  stable:
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    needs: attach
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Move stable to the release
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: git push --force origin "refs/tags/$TAG^{commit}:refs/heads/stable"
+
+  pages:
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: firmware
+          path: site/firmware
+      - name: Assemble the site
+        run: |
+          cp -r static/. site/
+          # Offer "Erase device": a board that got a key from Home Assistant keeps it
+          # otherwise, and Home Assistant then asks for a key that exists nowhere.
+          jq '.new_install_prompt_erase = true' site/firmware/manifest.json > site/firmware/wmbus-listener.manifest.json
+          rm site/firmware/manifest.json
+          rm -f site/firmware/*.elf
+          ls -lR site
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1

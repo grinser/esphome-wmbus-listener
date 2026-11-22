@@ -1,0 +1,242 @@
+# Daily kWh and the two load charts on the main page (drawn in loadchart.h).
+# Adds its logic to ha_time, energy_import and power_import via !extend.
+
+time:
+  - id: !extend ha_time
+    # Restore the intraday load profile after a reboot/OTA. This can't run at
+    # on_boot (HA time isn't synced yet) and the outage window can only be
+    # computed once we know the wall clock, so it hangs off the first sync and
+    # is guarded to run exactly once.
+    on_time_sync:
+      - then:
+          - lambda: |-
+              if (id(hist_restored)) return;
+              auto now = id(ha_time).now();
+              if (!now.is_valid()) return;
+              id(hist_restored) = true;
+              const int slot = now.hour * 4 + now.minute / 15;      // 0-95
+              const int qnum = (int)(now.timestamp / 900);          // quarter number
+              // Bring the persisted history back into the live array.
+              for (int i = 0; i < 96; i++) id(qh_kwh)[i] = id(qh_hist)[i];
+              // How many quarters passed since the last finalize? Walk that many
+              // slots back from "now" and blank them — those fell in the outage,
+              // and showing stale bars there would be a lie. Slots further back
+              // legitimately still hold yesterday (that's the ECG sweep).
+              // Deliberately counted in quarters rather than mapping qnum->slot:
+              // qnum is UTC-based, slot is local, and that mapping only works
+              // while the UTC offset is a whole number of quarters.
+              // Blank qh_hist as well, or a later reboot would bring the stale
+              // values back. (Across a DST switch the window lands up to 4 slots
+              // off; twice a year, cosmetic only.)
+              const int gap = qnum - id(last_qnum);
+              if (id(last_qnum) <= 0 || gap < 0 || gap >= 96) {
+                for (int i = 0; i < 96; i++) id(qh_kwh)[i] = id(qh_hist)[i] = 0.0f;  // nothing trustworthy
+              } else {
+                for (int k = 1; k <= gap; k++) {
+                  int s = ((slot - k) % 96 + 96) % 96;
+                  id(qh_kwh)[s] = id(qh_hist)[s] = 0.0f;
+                }
+              }
+              // The current slot restarts from this boot (qh_base is reseeded by
+              // the next telegram via the rollover branch, since qh_index == -1).
+              id(qh_kwh)[slot] = id(qh_hist)[slot] = 0.0f;
+
+globals:
+  # --- Daily energy + intraday load profile (main page) --------------------
+  # All derived from the meter's monotonic total register (energy_import), so
+  # the figures match the billing meter exactly.
+  - id: energy_today_base     # energy_import at the start of today; daily kWh =
+    type: float               # energy_import - energy_today_base. Changes once a
+    restore_value: true       # day, so persisting it (survives reboots) is cheap.
+    initial_value: 'NAN'
+
+  - id: energy_today_day      # day_of_year the bases belong to (midnight / reboot
+    type: int                 # -across-midnight detection)
+    restore_value: true
+    initial_value: '0'
+
+  - id: energy_today_valid    # true only when energy_today_base was captured at a
+    type: bool                # real midnight (day change seen live, in slot 0).
+    restore_value: true       # When false (fresh flash / mid-day boot) the main
+    initial_value: 'false'    # page falls back to the overall total like before.
+
+  - id: qh_kwh                # per-quarter-hour consumption today (96 = 24h/15min).
+    type: float[96]           # Live array, not persisted (it changes every telegram);
+    restore_value: false      # qh_hist below is its flash-safe snapshot for reboots.
+    # No initial_value: ESPHome zero-inits the array (value_{}). An explicit
+    # '{}' wrongly binds the scalar GlobalsComponent(T) ctor → float*→float error.
+
+  - id: qh_base               # energy_import at the start of the current 15 min slot
+    type: float
+    restore_value: false
+    initial_value: 'NAN'
+
+  - id: qh_index              # current quarter-hour slot (hour*4 + minute/15, 0-95)
+    type: int
+    restore_value: false
+    initial_value: '-1'
+
+  - id: qh_qnum               # quarter number (unix_epoch / 900) of qh_index; spots
+    type: int                 # quarters that passed without a telegram
+    restore_value: false
+    initial_value: '0'
+
+  # Persisted intraday history (survives reboot/OTA). Written only at each 15-min
+  # finalize (≤96 NVS writes/day) — never per-telegram — so it's flash-safe. On
+  # boot qh_hist is copied back into qh_kwh and the outage window is blanked.
+  - id: qh_hist               # snapshot of finalized 15-min slot energies (kWh)
+    type: float[96]
+    restore_value: true
+
+  - id: last_qnum             # quarter number (unix_epoch / 900) of the last finalize
+    type: int                 # used on boot to blank slots that fell in an outage
+    restore_value: true
+    initial_value: '0'
+
+  # --- 15-min fine panel: average power per minute-of-quarter (0-14) --------
+  # Not persisted (short-lived detail; a reboot just refills it). Never cleared
+  # at quarter rollover — rows ahead of the write head keep the previous
+  # quarter, which is what produces the ECG sweep.
+  - id: pm_min                # avg power_import (kW) per minute-of-quarter
+    type: float[15]
+    restore_value: false
+
+  - id: pm_sum                # running sum of power samples in the current minute
+    type: float
+    restore_value: false
+    initial_value: '0'
+
+  - id: pm_count              # sample count in the current minute
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  - id: pm_epoch_min          # minute number (unix_epoch / 60) being accumulated
+    type: int
+    restore_value: false
+    initial_value: '-1'
+
+  - id: hist_restored         # one-shot guard: qh_hist -> qh_kwh restore done
+    type: bool                # (runs on the first valid time sync, not at boot)
+    restore_value: false
+    initial_value: 'false'
+
+# Full-scale value for BOTH chart panels, adjustable from HA without a reflash.
+# The 2.5 kW default comes from 30 days of one household (median load 0.24 kW,
+# p99 slot ~2.1 kW: only ~0.8 % of slots clip). Deliberately not auto-learned: a
+# short, very high load (an instantaneous water heater draws 15-23 kW) would
+# ratchet any peak-tracking scale into uselessness and flatten everything else.
+number:
+  - platform: template
+    name: "Chart max"
+    id: chart_max_kw
+    icon: "mdi:chart-bar"
+    entity_category: config
+    unit_of_measurement: "kW"
+    min_value: 1.0
+    max_value: 6.0
+    step: 0.5
+    optimistic: true          # no hardware to set; reflect the commanded value
+    initial_value: ${chart_max_default}  # fresh flash (else it starts at min_value)
+    restore_value: true       # survives reboot
+
+sensor:
+  - id: !extend energy_import
+    # Maintain the daily total + the 96-slot quarter-hour load profile shown on
+    # the main page. Everything is a delta of this cumulative register, captured
+    # against per-day / per-quarter baselines. Needs valid HA time to bucket;
+    # before that we still seed the daily base so "today" starts from boot.
+    on_value:
+      - lambda: |-
+          auto now = id(ha_time).now();
+          // Cold start: seed the daily base from the first reading we ever see,
+          // so "today" counts from boot even before HA time is valid.
+          if (isnan(id(energy_today_base))) {
+            id(energy_today_base) = x;
+            id(qh_base) = x;
+          }
+          if (!now.is_valid()) return;
+          const int slot = now.hour * 4 + now.minute / 15;   // 0-95
+          // New day: reset the daily base only. The profile array is not wiped:
+          // the chart's X axis is fixed calendar time and slots ahead
+          // of the write gap deliberately still show yesterday (the ECG sweep).
+          // qh_base/qh_index are left to the rollover branch below, so the last
+          // slot of the day (23:45) gets finalised properly instead of being
+          // skipped. The base is "authoritative" (daily figure trustworthy) only
+          // when we caught the day change live in the first quarter-hour (slot
+          // 0); a fresh boot / wake later in the day sees the change at slot != 0,
+          // so the main page keeps showing the overall total until the next real
+          // midnight. The flag persists, so a reboot within the day keeps the
+          // correct daily figure.
+          if (id(energy_today_day) != now.day_of_year) {
+            id(energy_today_base) = x;
+            id(energy_today_day) = now.day_of_year;
+            id(energy_today_valid) = (slot == 0);
+          }
+          // Quarter-hour rollover: finalise the slot we were filling, start the
+          // next. The finalised value is also snapshotted into the persisted
+          // qh_hist (one NVS write per quarter at most — never per-telegram)
+          // together with the quarter number, which lets a reboot blank just the
+          // outage window.
+          if (id(qh_index) != slot) {
+            const int qnow = (int)(now.timestamp / 900);
+            if (id(qh_index) >= 0 && id(qh_index) < 96) {
+              float d = x - id(qh_base);
+              if (d < 0.0f) d = 0.0f;
+              const int real = qnow - id(qh_qnum);               // quarters elapsed
+              if (real >= 96) {
+                // Silent for a day or more: nothing on the chart is current.
+                for (int i = 0; i < 96; i++) id(qh_kwh)[i] = id(qh_hist)[i] = 0.0f;
+              } else {
+                // Slots passed without a telegram (radio gap) would otherwise keep
+                // yesterday's bars, drawn solid. Spread the energy over the
+                // quarters it really covers and zero the rest; counted in local
+                // slots so a DST jump forward blanks the skipped hour, while a
+                // jump back (or any odd step) falls back to a plain finalize.
+                const int adv = (slot - id(qh_index) + 96) % 96;   // local slots
+                const int n = (adv >= 1 && adv <= real + 4) ? adv : 1;
+                const int m = real < 1 ? 1 : (real > n ? n : real);
+                for (int k = 0; k < n; k++) {
+                  const int s = (id(qh_index) + k) % 96;
+                  const float v = k < m ? d / m : 0.0f;
+                  id(qh_kwh)[s] = id(qh_hist)[s] = v;
+                }
+              }
+              id(last_qnum) = qnow;
+            }
+            id(qh_base) = x;
+            id(qh_index) = slot;
+            id(qh_qnum) = qnow;
+          }
+          // Live current slot.
+          float d = x - id(qh_base);
+          id(qh_kwh)[slot] = d > 0.0f ? d : 0.0f;
+
+  - id: !extend power_import
+    # Feed the 15-min fine panel: average power per minute-of-quarter (0-14).
+    # pm_min[m] always holds the running average for the minute in progress, so
+    # the live row grows as samples arrive; when the minute rolls the value is
+    # simply left in place as that minute's final average. pm_min is never
+    # cleared at quarter rollover — rows ahead of the write head keep the
+    # previous quarter, which is what draws the ECG sweep.
+    on_value:
+      - lambda: |-
+          auto now = id(ha_time).now();
+          if (!now.is_valid() || isnan(x)) return;
+          const int me = (int)(now.timestamp / 60);
+          if (id(pm_epoch_min) != me) {             // minute rolled: start fresh
+            // Minutes without a telegram would keep the previous quarter's rows,
+            // drawn solid: blank them (all of them after 15+ silent minutes).
+            const int gap = me - id(pm_epoch_min);
+            if (id(pm_epoch_min) < 0 || gap < 0 || gap >= 15) {
+              for (int r = 0; r < 15; r++) id(pm_min)[r] = 0.0f;
+            } else {
+              for (int k = 1; k < gap; k++) id(pm_min)[((now.minute - k) % 15 + 15) % 15] = 0.0f;
+            }
+            id(pm_epoch_min) = me;
+            id(pm_sum) = 0.0f;
+            id(pm_count) = 0;
+          }
+          id(pm_sum) += x;
+          id(pm_count) += 1;
+          id(pm_min)[now.minute % 15] = id(pm_sum) / id(pm_count);

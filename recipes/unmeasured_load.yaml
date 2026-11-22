@@ -1,0 +1,54 @@
+# Recipe 2: unmeasured load
+#
+# The meter measures the whole home. Smart plugs measure single devices. The
+# difference is the load that no plug measures: stove, oven, water heater,
+# lights and other fixed devices.
+#
+# "Large unmeasured load" is on while the difference is above 0.8 kW. Gaps of up
+# to 3 minutes count as one run, because stove plates switch on and off.
+# "Stove on" is on after such a run lasts 7 minutes. In the tested apartment,
+# over 10 days, every run of this length was the stove, the oven or a pot of
+# boiling eggs. A microwave or a coffee machine on a short run stays below.
+# Several short loads one after the other can still count.
+#
+# Setup:
+#   1. Replace the plug entities in the "plugs" list with your plugs. They
+#      must report power in W. The meter reports kW.
+#   2. Add the same plugs to the availability list. If a plug that can draw
+#      more than 0.5 kW is offline, its load reads as unmeasured.
+#
+# Above 8 kW (hot water, see hot_water.yaml), the sensor stays off.
+#
+# Needs: meter_reporting.yaml
+
+template:
+  - sensor:
+      - name: "Unmeasured power"
+        unique_id: wmbus_unmeasured_power
+        unit_of_measurement: W
+        device_class: power
+        state_class: measurement
+        state: >-
+          {% set plugs = ['sensor.plug_1_power', 'sensor.plug_2_power', 'sensor.plug_3_power'] %}
+          {% set ns = namespace(w=0) %}
+          {% for p in plugs %}{% set ns.w = ns.w + states(p) | float(0) %}{% endfor %}
+          {{ (states('sensor.wm_bus_meter_power_import') | float(0) * 1000 - ns.w) | round(0) }}
+        availability: >-
+          {{ ['sensor.wm_bus_meter_power_import', 'sensor.plug_1_power', 'sensor.plug_2_power',
+              'sensor.plug_3_power'] | select('has_value') | list | length == 4
+             and is_state('binary_sensor.meter_reporting', 'on') }}
+
+  - binary_sensor:
+      - name: "Large unmeasured load"
+        unique_id: wmbus_large_unmeasured_load
+        state: >-
+          {{ states('sensor.wm_bus_meter_power_import') | float(0) < 8
+             and states('sensor.unmeasured_power') | float(0) > 800 }}
+        availability: "{{ has_value('sensor.unmeasured_power') }}"
+        delay_off: "00:03:00"
+
+      - name: "Stove on"
+        unique_id: wmbus_stove_on
+        state: "{{ is_state('binary_sensor.large_unmeasured_load', 'on') }}"
+        availability: "{{ has_value('binary_sensor.large_unmeasured_load') }}"
+        delay_on: "00:07:00"

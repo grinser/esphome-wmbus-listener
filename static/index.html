@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wM-Bus Meter installer</title>
+  <meta name="description" content="Install the wM-Bus smart meter firmware on a Heltec WiFi LoRa 32 V3 from the browser.">
+  <!-- ESP Web Tools 10.4.0 (Apache-2.0), copied from the npm package (integrity checked), no CDN -->
+  <script type="module" src="esp-web-tools/install-button.js"></script>
+  <style>
+    :root { color-scheme: light dark; --fg: #1d1f21; --bg: #fff; --muted: #5f6368; --accent: #0b6bcb; }
+    @media (prefers-color-scheme: dark) { :root { --fg: #e8eaed; --bg: #16181b; --muted: #9aa0a6; --accent: #6cb2ff; } }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 system-ui, sans-serif; }
+    main { max-width: 42rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
+    h1 { font-size: 1.6rem; margin: 0 0 .5rem; }
+    h2 { font-size: 1.15rem; margin-top: 2rem; }
+    p.lead, .muted { color: var(--muted); }
+    a { color: var(--accent); }
+    ol li { margin-bottom: .4rem; }
+    .install { margin: 1.5rem 0; }
+    code { font-size: .92em; }
+    nav.lang { float: right; font-size: .9rem; }
+    figure { margin: 1.5rem 0; }
+    figure img { width: 100%; height: auto; border-radius: 12px; display: block; }
+    figcaption { color: var(--muted); font-size: .9rem; margin-top: .4rem; }
+    .cable { display: grid; grid-template-columns: auto 1fr; gap: .3rem 1rem; align-items: center; margin: 1rem 0 1.5rem; }
+    .cable svg { width: 15rem; max-width: 48vw; height: auto; color: var(--fg); }
+    .ok { color: #188038; } .no { color: #c5221f; }
+    @media (prefers-color-scheme: dark) { .ok { color: #81c995; } .no { color: #f28b82; } }
+    .version { color: var(--muted); font-size: .9rem; }
+  </style>
+</head>
+<body>
+<main>
+  <nav class="lang"><a href="?lang=en" lang="en" hidden>English</a><a href="?lang=de" lang="de">Deutsch</a></nav>
+  <!-- One page, two languages: the script shows the browser's language (de or en), ?lang= overrides it.
+       Without JavaScript the English text stays visible. -->
+  <div lang="en">
+  <h1>wM-Bus Meter installer</h1>
+  <p class="lead">Installs the firmware on a Heltec WiFi LoRa 32 V3 straight from this page. You need Chrome or Edge on a
+    computer, a USB-A to USB-C data cable and the AES key for your meter.</p>
+  </div>
+  <div lang="de" hidden>
+  <h1>wM-Bus-Zähler installieren</h1>
+  <p class="lead">Installiert die Firmware direkt von dieser Seite auf ein Heltec WiFi LoRa 32 V3. Du brauchst Chrome oder
+    Edge auf einem Computer, ein USB-A-auf-USB-C-Datenkabel und den AES-Schlüssel deines Zählers.</p>
+  </div>
+
+  <figure>
+    <img src="img/board.jpg" width="1200" height="393"
+      alt="The board in its case: display in the middle, antenna on the right, the PRG button top left and the RST button bottom left">
+  </figure>
+
+  <div class="cable" aria-hidden="true">
+    <svg viewBox="0 0 240 28" role="img"><rect x="2" y="7" width="30" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><rect x="8" y="11" width="18" height="4" fill="currentColor"/><line x1="32" y1="14" x2="198" y2="14" stroke="currentColor" stroke-width="3"/><rect x="198" y="8" width="20" height="12" rx="6" fill="none" stroke="currentColor" stroke-width="2"/><text x="40" y="7" font-size="9" fill="currentColor" font-family="system-ui,sans-serif">USB-A</text><text x="160" y="7" font-size="9" fill="currentColor" font-family="system-ui,sans-serif">USB-C</text></svg>
+    <b class="ok">✓ <span lang="en">works</span><span lang="de" hidden>geht</span></b>
+    <svg viewBox="0 0 240 28" role="img"><rect x="2" y="8" width="20" height="12" rx="6" fill="none" stroke="currentColor" stroke-width="2"/><line x1="22" y1="14" x2="198" y2="14" stroke="currentColor" stroke-width="3"/><rect x="198" y="8" width="20" height="12" rx="6" fill="none" stroke="currentColor" stroke-width="2"/><text x="30" y="7" font-size="9" fill="currentColor" font-family="system-ui,sans-serif">USB-C</text><text x="160" y="7" font-size="9" fill="currentColor" font-family="system-ui,sans-serif">USB-C</text></svg>
+    <b class="no">✗ <span lang="en">board often stays dark</span><span lang="de" hidden>Board bleibt oft dunkel</span></b>
+  </div>
+
+  <div class="install">
+    <esp-web-install-button manifest="firmware/wmbus-listener.manifest.json">
+      <span slot="unsupported"><span lang="en">This browser cannot install firmware. Use Chrome or Edge on a computer.</span><span lang="de" hidden>Dieser Browser kann keine Firmware installieren. Nimm Chrome oder Edge auf einem Computer.</span></span>
+      <span slot="not-allowed"><span lang="en">The page must be opened over https.</span><span lang="de" hidden>Die Seite muss über https geöffnet werden.</span></span>
+    </esp-web-install-button>
+  </div>
+
+  <div lang="en">
+  <h2>Before you start</h2>
+  <p>Get the AES key of your meter from your grid operator. At Linz Netz, activate the customer interface on the
+    <a href="https://www.linznetz.at/portal/de/home/online_services/serviceportal/kundenschnittstelle">Kundenschnittstelle page</a>;
+    the access code you get is the key. Other operators:
+    <a href="https://github.com/grinser/esphome-wmbus-listener/blob/main/docs/setup.md#1-get-the-key-from-your-grid-operator">setup guide, step 1</a>.
+    You can install before you have the key.</p>
+
+  <h2>Steps</h2>
+  <ol>
+    <li>Connect the board with a USB-A to USB-C data cable and select <b>Connect</b>. Pick the serial port of the
+      board.</li>
+    <li>Select <b>Install</b>. If the board ran other firmware before, tick <b>Erase device</b>. It takes about two minutes.</li>
+    <li>Enter your Wi-Fi name and password when the page asks for them.</li>
+    <li>Select <b>Add to Home Assistant</b> at the end of the install, or open <b>Settings → Devices &amp; services</b>
+      in Home Assistant. Add the new device within 30 minutes of plugging the board in.</li>
+    <li>On the device page under <b>Configuration</b>, enter the radio address in <b>New meter address</b> and the
+      AES key in <b>New meter key</b>. The board saves them 60 seconds later. The <b>Meters nearby</b> sensor lists
+      the meters the board hears; yours is marked <i>electricity</i>.</li>
+  </ol>
+
+  <h2>If it does not work</h2>
+  <ul>
+    <li><b>No port to pick:</b> use another cable (some only charge). On Windows, if the port still does not show up,
+      install the <a href="https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers">CP210x driver</a>
+      (the “CP210x Universal Windows Driver” download).</li>
+    <li><b>Install fails:</b> the two buttons sit left of the display, PRG at the top and RST at the bottom. Hold PRG,
+      press RST, release PRG, then select Connect again.</li>
+    <li><b>No Wi-Fi prompt:</b> keep the board connected, reload this page, select <b>Connect</b> and then
+      <b>Change Wi-Fi</b>.</li>
+    <li><b>Home Assistant does not find it after 30 minutes:</b> unplug the board and plug it in again.</li>
+    <li><b>Home Assistant asks for an encryption key:</b> close the dialog and restart Home Assistant. If it still asks, install again with <b>Erase device</b> ticked.</li>
+  </ul>
+
+  <p class="muted">Source code, documentation and the other ways to install:
+    <a href="https://github.com/grinser/esphome-wmbus-listener">github.com/grinser/esphome-wmbus-listener</a>.
+    What the display shows: <a href="https://github.com/grinser/esphome-wmbus-listener/blob/main/docs/troubleshooting.md#setup-screens">setup screens</a>.</p>
+  </div>
+
+  <div lang="de" hidden>
+  <h2>Bevor du anfängst</h2>
+  <p>Hol dir den AES-Schlüssel deines Zählers beim Netzbetreiber. Bei Linz Netz aktivierst du auf der
+    <a href="https://www.linznetz.at/portal/de/home/online_services/serviceportal/kundenschnittstelle">Seite zur Kundenschnittstelle</a>
+    die Kundenschnittstelle; der Zugangscode, den du bekommst, ist der Schlüssel. Andere Netzbetreiber:
+    <a href="https://github.com/grinser/esphome-wmbus-listener/blob/main/docs/setup.md#1-get-the-key-from-your-grid-operator">Anleitung, Schritt 1</a>
+    (Englisch). Installieren kannst du auch schon vorher.</p>
+
+  <h2>Schritte</h2>
+  <p class="muted">Das Installationsfenster selbst ist auf Englisch, die Knöpfe heißen deshalb unten so wie dort.</p>
+  <ol>
+    <li>Schließ das Board mit einem USB-A-auf-USB-C-Datenkabel an und wähl <b>Connect</b>. Such dir den seriellen Anschluss des
+      Boards aus.</li>
+    <li>Wähl <b>Install</b>. Lief auf dem Board schon eine andere Firmware, setz das Häkchen bei <b>Erase device</b>. Das dauert etwa zwei Minuten.</li>
+    <li>Gib Name und Passwort deines WLANs ein, wenn die Seite danach fragt.</li>
+    <li>Wähl am Ende der Installation <b>Add to Home Assistant</b> oder öffne in Home Assistant <b>Einstellungen →
+      Geräte &amp; Dienste</b>. Füg das neue Gerät innerhalb von 30 Minuten nach dem Anstecken hinzu.</li>
+    <li>Trag auf der Geräteseite unter <b>Konfiguration</b> die Funkadresse in <b>New meter address</b> und den
+      AES-Schlüssel in <b>New meter key</b> ein. Das Board speichert sie 60 Sekunden später. Der Sensor
+      <b>Meters nearby</b> zeigt die Zähler, die das Board empfängt; deiner ist mit <i>electricity</i> markiert.</li>
+  </ol>
+
+  <h2>Wenn es nicht klappt</h2>
+  <ul>
+    <li><b>Kein Anschluss zur Auswahl:</b> nimm ein anderes Kabel (manche laden nur). Wenn unter Windows weiterhin kein
+      Anschluss erscheint, installier den <a href="https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers">CP210x-Treiber</a>
+      (der Download „CP210x Universal Windows Driver“).</li>
+    <li><b>Die Installation schlägt fehl:</b> die zwei Tasten sitzen links neben dem Display, PRG oben und RST unten.
+      Halt PRG gedrückt, drück kurz RST, lass PRG los und wähl dann wieder <b>Connect</b>.</li>
+    <li><b>Keine Frage nach dem WLAN:</b> lass das Board angesteckt, lad die Seite neu, wähl <b>Connect</b> und dann
+      <b>Change Wi-Fi</b>.</li>
+    <li><b>Home Assistant findet es nach 30 Minuten nicht:</b> steck das Board ab und wieder an.</li>
+    <li><b>Home Assistant fragt nach einem Schlüssel:</b> schließ den Dialog und starte Home Assistant neu. Fragt es weiter, installier noch einmal mit Häkchen bei <b>Erase device</b>.</li>
+  </ul>
+
+  <p class="muted">Quellcode, Dokumentation (auf Englisch) und die anderen Wege zur Installation:
+    <a href="https://github.com/grinser/esphome-wmbus-listener">github.com/grinser/esphome-wmbus-listener</a>.
+    Was das Display zeigt: <a href="https://github.com/grinser/esphome-wmbus-listener/blob/main/docs/troubleshooting.md#setup-screens">Einrichtungsanzeigen</a> (Englisch).</p>
+  </div>
+
+  <p class="version" id="version" hidden><span lang="en">Firmware</span><span lang="de" hidden>Firmware</span>
+    <span id="version-number"></span> ·
+    <a href="https://github.com/grinser/esphome-wmbus-listener/releases/latest"><span lang="en">release notes</span><span lang="de" hidden>Versionshinweise</span></a></p>
+</main>
+<script>
+  (function () {
+    var q = new URLSearchParams(location.search).get("lang");
+    var pick = q === "de" || q === "en" ? q
+      : ((navigator.languages && navigator.languages[0]) || navigator.language || "").slice(0, 2) === "de" ? "de" : "en";
+    document.documentElement.lang = pick;
+    document.querySelectorAll("main [lang]").forEach(function (el) { el.hidden = el.lang !== pick; });
+    // The switch link offers the other language.
+    document.querySelectorAll("nav.lang a").forEach(function (a) { a.hidden = a.lang === pick; });
+    // Show the version the install button offers (from the same manifest).
+    fetch("firmware/wmbus-listener.manifest.json").then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (m) {
+        if (!m || !m.version) return;
+        document.getElementById("version-number").textContent = m.version;
+        document.getElementById("version").hidden = false;
+      }).catch(function () {});
+  })();
+</script>
+</body>
+</html>

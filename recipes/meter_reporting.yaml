@@ -1,0 +1,23 @@
+# Recipe 3: meter reporting
+#
+# The meter sends about every 5 seconds. When reception stops, Home Assistant
+# keeps the last value, so a sensor can show an old value as if it were current.
+# This sensor is "on" while the board has reported within the last 5 minutes.
+# The other recipes use it to become unavailable instead of using old values.
+#
+# "Reported" is the newer last_reported time of Power Import and wM-Bus RSSI.
+# ESPHome does not send a value again if it did not change, and the RSSI
+# changes with almost every message.
+#
+# 5 minutes: with 2 minutes, normal reception gaps at a poor receiver position
+# made the sensor unavailable too often.
+
+template:
+  - binary_sensor:
+      - name: "Meter reporting"
+        unique_id: wmbus_meter_reporting
+        device_class: connectivity
+        state: >-
+          {% set s = expand('sensor.wm_bus_meter_power_import', 'sensor.wm_bus_meter_wm_bus_rssi')
+                     | selectattr('state', 'is_number') | map(attribute='last_reported') | list %}
+          {{ s | count > 0 and (now() - (s | max)).total_seconds() < 300 }}

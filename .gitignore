@@ -1,0 +1,15 @@
+# Real secrets — never commit. Use secrets.yaml.example as the template.
+/secrets.yaml
+
+# ESPHome build artifacts
+/.esphome/
+*.bin
+
+# Host test build output
+/tests/lambdas.inc
+/tests/chart_logic_test
+/tests/settings_test
+/tests/status_test
+
+# 1:1 render from tools/render_display.py
+/docs/*-1x.png

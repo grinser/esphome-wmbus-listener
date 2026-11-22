@@ -1,0 +1,651 @@
+# OLED pages, brightness and the PRG button.
+# Brightness, night hours and boost time: settings in Home Assistant (start
+# values: substitutions in wmbus.yaml).
+
+# Heltec V3 onboard SSD1306 128x64 OLED. Native ESPHome display; only the load
+# chart is drawn in loadchart.h. The OLED is powered via Vext (GPIO36, active-LOW),
+# reset on GPIO21, I2C on GPIO17/18. Fonts are pulled from Google Fonts at build.
+#
+# The display idles always-on at minimum contrast on the main page (status icons
+# + big current power) — that costs <1 mA against the ~20-40 mA Wi-Fi/radio
+# baseline (~2-3 % battery runtime). At night the idle panel goes fully dark
+# instead. A PRG press boosts brightness for a while (day or night level, see
+# show_display); while boosted, further presses
+# step through the detail pages and wrap back to main, then the idle_display
+# script drops back to the dim (or dark) main page. Burn-in is mitigated by the
+# low idle contrast plus a 1 px drift of the main page within a 2x2 px square
+# every 3 min. Vext stays on so the SSD1306 never needs re-initialising.
+globals:
+  - id: display_awake         # true while the OLED shows (button wake / boot screen)
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: link_screen           # Wi-Fi / HA setup screen (LinkState), LINK_OK = none
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  - id: meter_screen          # setup screen on the main page (MeterState), -1 = none
+    type: int
+    restore_value: false
+    initial_value: '-1'
+
+  - id: idle_shift_x          # burn-in mitigation: main page nudges within a
+    type: int                 # 2x2 px square on a 3 min cycle
+    restore_value: false
+    initial_value: '0'
+
+  - id: idle_shift_y
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+# Vext rail (GPIO36, active-LOW). The gpio switch below keeps it on, but it is
+# set up after the I2C bus (priority 800 vs 1000). After a power-on the unpowered
+# OLED holds SCL low, and the I2C bus recovery logs "SCL is held LOW". So drive
+# Vext on first, before the I2C bus starts.
+esphome:
+  on_boot:
+    - priority: 1100
+      then:
+        - lambda: |-
+            gpio_set_direction(GPIO_NUM_36, GPIO_MODE_OUTPUT);
+            gpio_set_level(GPIO_NUM_36, 0);   // active-LOW: OLED powered
+            delay(5);                         // let the OLED rail settle
+
+switch:
+  - platform: gpio
+    id: vext_power
+    pin:
+      number: GPIO36
+      inverted: true
+    restore_mode: ALWAYS_ON
+    internal: true            # board-level power control, not a user-facing entity
+
+  # Off: the idle display stays dim at night instead of going dark.
+  - platform: template
+    name: "Display off at night"
+    id: display_night_off
+    icon: mdi:monitor-off
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return !id(display_awake);'
+          then:
+            - script.execute: idle_display
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return !id(display_awake);'
+          then:
+            - script.execute: idle_display
+
+i2c:
+  sda: GPIO17
+  scl: GPIO18
+  frequency: 400kHz
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_title
+    size: 14
+  - file: "gfonts://Roboto"
+    id: font_body
+    size: 12
+  - file: "gfonts://Roboto"
+    id: font_small        # status-bar battery %
+    size: 10
+  - file: "gfonts://Roboto@700"
+    id: font_big          # main page: current power
+    size: 24
+  - file: "gfonts://Roboto@700"
+    id: font_big_sm       # fallback: a wide reading (10+ kW) that would reach
+    size: 20              # the fine-chart column steps down to this
+
+# Screen "Wi-Fi" on a factory board without Wi-Fi: the web installer page, where
+# Improv over USB sets the Wi-Fi. Version 3 (29x29), drawn at scale 2.
+qr_code:
+  - id: installer_qr
+    value: https://grinser.github.io/esphome-wmbus-listener/
+    ecc: LOW
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    reset_pin: GPIO21
+    id: oled
+    update_interval: 1s
+    pages:
+      # Main page: phone-style status bar (868 MHz bars + telegram dot / Wi-Fi
+      # fan / clock / battery %) + big current power + "kWh today" + the load chart (24 h
+      # band along the bottom, current quarter hour in the right column). All icons and the
+      # chart are drawn with primitives — no icon font needed. (Charge state is
+      # shown by the transient page_charging splash, not a persistent bolt.)
+      - id: page_main
+        lambda: |-
+          // Burn-in mitigation: the always-on page drifts within a 2x2 px
+          // square (idle_shift_* cycle, 3 min). The status bar / power / daily
+          // lines take the full ox/oy nudge; the bottom chart is anchored to
+          // the screen edge and takes only the horizontal (ox) shift, so it
+          // never spills past y63.
+          const int ox = id(idle_shift_x), oy = id(idle_shift_y);
+          // --- Wi-Fi / Home Assistant setup screen ---------------------
+          // Before the meter is OK once: no Wi-Fi stored, Wi-Fi not found, or
+          // the board still has to be added in HA (factory firmware).
+          if (!id(meter_ok_seen) && id(link_screen) != LINK_OK) {
+            switch ((LinkState) id(link_screen)) {
+              case LINK_NO_CREDS: {
+                // QR dark on a lit square with a 1-module quiet zone: 62x62 px.
+                it.filled_rectangle(0 + ox, 1 + oy, 62, 62);
+                it.qr_code(2 + ox, 3 + oy, id(installer_qr), COLOR_OFF, 2);
+                it.print(64 + ox, 0 + oy, id(font_title), "Wi-Fi");
+                static const char *const L[4] = {"Connect USB,", "open the", "page, enter", "your Wi-Fi."};
+                for (int i = 0; i < 4; i++)
+                  it.print(64 + ox, 16 + 12 * i + oy, id(font_small), L[i]);
+                break;
+              }
+              case LINK_WIFI_NOT_FOUND: {
+                it.print(0 + ox, 0 + oy, id(font_title), "Wi-Fi not found");
+                // get_sta() returns a copy: keep it alive while its SSID is used.
+                auto sta = wifi::global_wifi_component->get_sta();
+                std::string name(sta.get_ssid().c_str());
+                if (!name.empty()) {
+                  // Long names: small font, then cut on a UTF-8 character boundary.
+                  auto *font = id(font_body);
+                  std::string line;
+                  bool cut = false;
+                  while (true) {
+                    line = "\u201c" + name + (cut ? "\u2026" : "") + "\u201d";
+                    int x1, y1, w, h;
+                    it.get_text_bounds(0, 0, line.c_str(), font, TextAlign::TOP_LEFT, &x1, &y1, &w, &h);
+                    if (w + ox <= 128 || name.empty()) break;
+                    if (font == id(font_body)) { font = id(font_small); continue; }
+                    // Drop the last character: its continuation bytes, then its lead byte.
+                    while (!name.empty() && (name.back() & 0xC0) == 0x80) name.pop_back();
+                    if (!name.empty()) name.pop_back();
+                    cut = true;
+                  }
+                  it.print(0 + ox, 17 + oy, font, line.c_str());
+                }
+                it.print(0 + ox, 32 + oy, id(font_body), "Router on? In range?");
+                it.print(0 + ox, 47 + oy, id(font_body), "Retrying \u2026");
+                break;
+              }
+              case LINK_HA_ADD: {
+                it.print(0 + ox, 0 + oy, id(font_title), "Home Assistant");
+                it.print(0 + ox, 17 + oy, id(font_body), "Add this device:");
+                it.print(0 + ox, 32 + oy, id(font_body), App.get_name().c_str());
+                int left = provisioning_minutes_left(millis());
+                it.rectangle(0 + ox, 50 + oy, 70, 9);
+                it.filled_rectangle(2 + ox, 52 + oy, (66 * left + PROVISIONING_WINDOW_MIN / 2) / PROVISIONING_WINDOW_MIN, 5);
+                it.printf(127 + ox, 47 + oy, id(font_body), TextAlign::TOP_RIGHT, "%d min", left);
+                break;
+              }
+              default: {  // LINK_HA_CLOSED
+                it.print(0 + ox, 0 + oy, id(font_title), "Home Assistant");
+                char l[24];
+                snprintf(l, sizeof(l), "%d min are over.", PROVISIONING_WINDOW_MIN);
+                it.print(0 + ox, 17 + oy, id(font_body), l);
+                it.print(0 + ox, 32 + oy, id(font_body), "Unplug and plug in");
+                it.print(0 + ox, 47 + oy, id(font_body), "again to add it.");
+                break;
+              }
+            }
+            return;
+          }
+          // --- Setup screen --------------------------------------------
+          // Until the meter is OK once after the start, a screen that says
+          // what is missing replaces this page (meter_screen_next in status.h).
+          // A meter lost later does not bring it back.
+          if (id(meter_screen) != METER_SCREEN_NONE) {
+            MeterState mst = (MeterState) id(meter_screen);
+            std::string addr;
+            int rssi = 0, n = 0;
+            bool any = strongest_nearby(id(meters_nearby), id(meter_addr_active), addr, rssi, n);
+            const char *title = "";
+            char l[3][40] = {"", "", ""};
+            switch (mst) {
+              case METER_NOT_SET_UP:
+                title = "Set up the meter";
+                if (any) {
+                  snprintf(l[0], sizeof(l[0]), "Strongest nearby:");
+                  snprintf(l[1], sizeof(l[1]), "%s  −%d dBm", addr.c_str(), -rssi);
+                } else {
+                  snprintf(l[0], sizeof(l[0]), "No meter heard yet.");
+                }
+                // A web-installer board without Wi-Fi has to get on Wi-Fi first.
+                snprintf(l[2], sizeof(l[2]), wifi::global_wifi_component->is_connected()
+                                                 ? "In HA: set_meter" : "Wi-Fi not connected");
+                break;
+              case METER_RADIO_SILENT:
+                title = "No radio at all";
+                snprintf(l[0], sizeof(l[0]), "Not a single frame.");
+                snprintf(l[1], sizeof(l[1]), "Keep away from USB");
+                snprintf(l[2], sizeof(l[2]), "chargers, routers.");
+                break;
+              case METER_FOREIGN_ONLY: {
+                if (any)
+                  snprintf(l[0], sizeof(l[0]), "%d other%s, best −%d dBm", n, n == 1 ? "" : "s", -rssi);
+                else  // short frames without an address, or the list was just cleared
+                  snprintf(l[0], sizeof(l[0]), "Only other frames.");
+                title = "Meter not heard";
+                snprintf(l[1], sizeof(l[1]), "Too far, or meter");
+                snprintf(l[2], sizeof(l[2]), "interface not on?");
+                break;
+              }
+              default:  // METER_NO_VALUES
+                title = "Wrong key?";
+                if (id(our_frame_count) > 999)
+                  snprintf(l[0], sizeof(l[0]), "Meter heard ×999+,");
+                else
+                  snprintf(l[0], sizeof(l[0]), "Meter heard ×%d,", id(our_frame_count));
+                snprintf(l[1], sizeof(l[1]), "but no values.");
+                snprintf(l[2], sizeof(l[2]), "Check key in HA.");
+                break;
+            }
+            it.print(0 + ox, 0 + oy, id(font_title), title);
+            // A rare wide line (8 meters at -100 dBm) steps down to the small font.
+            for (int i = 0; i < 3; i++) {
+              int x1, y1, w, h;
+              it.get_text_bounds(0, 0, l[i], id(font_body), TextAlign::TOP_LEFT, &x1, &y1, &w, &h);
+              it.print(0 + ox, 17 + 15 * i + oy, w + ox <= 128 ? id(font_body) : id(font_small), l[i]);
+            }
+            return;
+          }
+          // --- Status bar (y 0-11) -------------------------------------
+          // 868 MHz first: the telegram dot in the top-left corner, above the
+          // first bar: filled briefly per telegram of ours, nothing between
+          // telegrams, hollow = only other meters in the last minute, X =
+          // nothing at all in the last minute. Then 4 bars by the RSSI of our
+          // meter (status.h).
+          const uint32_t ms = millis();
+          int bars = rx_ours_recent(ms, id(our_frame_count), id(last_our_frame_ms))
+                         ? rx_bars(id(our_rssi)) : 0;
+          for (int i = 0; i < 4; i++) {
+            int h = 3 + i * 2;                         // 3,5,7,9 px tall
+            if (i < bars) it.filled_rectangle(3 + i * 4 + ox, 12 - h + oy, 3, h);
+            else          it.rectangle(3 + i * 4 + ox, 12 - h + oy, 3, h);
+          }
+          const int dx = 3 + ox, dy = 4 + oy;
+          switch (rx_dot(ms, id(frame_count), id(last_frame_ms), id(our_frame_count), id(last_our_frame_ms))) {
+            case RX_DOT_FLASH:   it.filled_circle(dx, dy, 2); break;
+            case RX_DOT_FOREIGN: it.circle(dx, dy, 2); break;
+            case RX_DOT_SILENT:
+              it.line(dx - 2, dy - 2, dx + 2, dy + 2);
+              it.line(dx - 2, dy + 2, dx + 2, dy - 2);
+              break;
+            default: break;
+          }
+          // Wi-Fi second: the fan from status.h (pixel tables agreed in #5).
+          draw_wifi_fan(it, 22 + ox, 1 + oy,
+                        wifi_fan(wifi::global_wifi_component->is_connected(),
+                                 id(wifi_signal_db).state));
+          // Battery: % text + filled outline (right-aligned). No persistent charge
+          // bolt — charge state isn't reliably knowable from voltage; a plug-in
+          // instead fires the full-screen page_charging splash (see charging_splash).
+          float pct = id(battery_level).state;
+          it.rectangle(107 + ox, 1 + oy, 18, 10);                // body
+          it.filled_rectangle(125 + ox, 4 + oy, 2, 4);           // nub
+          if (!isnan(pct)) {
+            int fw = (int)(pct * 0.14f + 0.5f);                  // 0-14 px fill
+            if (fw > 0) it.filled_rectangle(109 + ox, 3 + oy, fw, 6);
+            it.printf(103 + ox, 0 + oy, id(font_small), TextAlign::TOP_RIGHT, "%.0f%%", pct);
+          }
+          // Clock: HH:MM centered in the gap between the Wi-Fi fan (ends x36)
+          // and the battery % (right-aligned at x103). "--:--" until HA time is up.
+          auto now = id(ha_time).now();
+          if (now.is_valid())
+            it.strftime(60 + ox, 0 + oy, id(font_small), TextAlign::TOP_CENTER, "%H:%M", now);
+          else
+            it.print(60 + ox, 0 + oy, id(font_small), TextAlign::TOP_CENTER, "--:--");
+          // --- Current power (big) + "kWh today", both centered ---------
+          // The rotated 15-min chart owns the right column (x >= 112). These
+          // lines stay centered on x64; we measure each string and, only if
+          // centering it would cross that keep-out line, drop to a smaller font.
+          // Rarely fires (typical "1.24 kW" clears it; a 10+ kW water-heater
+          // reading is what triggers the big-line step-down).
+          // The big power value keeps 4 px clear of the chart (right edge <= 108),
+          // the smaller kWh line may reach x111.
+          auto fit = [&](const char *s, display::BaseFont *big, display::BaseFont *sm,
+                         int right) -> display::BaseFont * {
+            int x1, y1, w, h;
+            it.get_text_bounds(0, 0, s, big, TextAlign::TOP_LEFT, &x1, &y1, &w, &h);
+            return (64 + w / 2 <= right) ? big : sm;
+          };
+          char buf[24];
+          float p = id(power_import).state;
+          if (isnan(p))            snprintf(buf, sizeof(buf), "---");
+          else if (p < 1.0f)       snprintf(buf, sizeof(buf), "%.0f W", p * 1000.0f);
+          else                     snprintf(buf, sizeof(buf), "%.2f kW", p);
+          it.print(64 + ox, 12 + oy, fit(buf, id(font_big), id(font_big_sm), 108),
+                   TextAlign::TOP_CENTER, buf);
+          // "kWh today" when we have a trustworthy midnight baseline; otherwise
+          // fall back to the overall total (fresh flash / first boot of the
+          // day, until the next real midnight).
+          float e = id(energy_import).state, base = id(energy_today_base);
+          if (id(energy_today_valid) && !isnan(e) && !isnan(base)) {
+            float today = e - base; if (today < 0.0f) today = 0.0f;
+            snprintf(buf, sizeof(buf), "%.2f kWh today", today);
+          } else if (!isnan(e)) {
+            snprintf(buf, sizeof(buf), "%.1f kWh total", e);
+          } else if (id(meter_st) == METER_NO_VALUES) {
+            snprintf(buf, sizeof(buf), "Decode: need key");
+          } else if (id(our_frame_count) == 0) {
+            snprintf(buf, sizeof(buf), "No telegram yet");
+          } else {
+            snprintf(buf, sizeof(buf), "Waiting for values");
+          }
+          // While something is wrong, every other 4 s slot shows a hint
+          // instead, inverted (hint_for_slot in status.h).
+          Hint hint = hint_for_slot(millis(), id(hint_bits));
+          if (hint != HINT_COUNT) {
+            const char *h = hint_text(hint);
+            int x1, y1, w, hh;
+            it.get_text_bounds(0, 0, h, id(font_body), TextAlign::TOP_LEFT, &x1, &y1, &w, &hh);
+            it.filled_rectangle(64 - w / 2 - 3 + ox, 37 + oy, w + 6, 13);
+            it.print(64 + ox, 36 + oy, id(font_body), COLOR_OFF, TextAlign::TOP_CENTER, h);
+          } else {
+            it.print(64 + ox, 36 + oy, fit(buf, id(font_body), id(font_small), 111),
+                     TextAlign::TOP_CENTER, buf);
+          }
+          // --- Load profile chart: full-width 24 h band (y53-63) + rotated
+          // 15-min fine chart in the right column. All layout lives in
+          // loadchart.h.
+          if (now.is_valid()) {
+            const int cur = now.hour * 4 + now.minute / 15;      // 0-95
+            const int m   = now.minute % 15;                     // 0-14
+            draw_load_chart(it, ox, id(qh_kwh), id(pm_min),
+                            id(chart_max_kw).state, cur, m);
+          }
+      - id: page_status
+        lambda: |-
+          it.print(0, 0, id(font_title), "wM-Bus Meter");
+          it.printf(0, 17, id(font_body), "IP: %s",
+                    id(ip_text).has_state() ? id(ip_text).state.c_str() : "...");
+          if (isnan(id(wifi_signal_db).state))
+            it.print(0, 32, id(font_body), "WiFi: not connected");
+          else
+            it.printf(0, 32, id(font_body), "WiFi: %.0f dBm", id(wifi_signal_db).state);
+          if (id(frame_count) == 0)
+            it.print(0, 47, id(font_body), "RX: waiting...");
+          else
+            it.printf(0, 47, id(font_body), "RX: %.0f dBm  #%d",
+                      id(last_rssi), id(frame_count));
+      - id: page_meter
+        lambda: |-
+          it.print(0, 0, id(font_title), "Electricity");
+          if (id(our_frame_count) == 0) {
+            // Our meter hasn't transmitted yet — customer interface likely not active.
+            it.print(0, 24, id(font_body), "No telegram yet");
+            it.print(0, 39, id(font_body), "(meter TX off?)");
+          } else if (isnan(id(energy_import).state)) {
+            // Receiving our meter, but can't decode — AES key missing/wrong.
+            uint32_t ago = (millis() - id(last_our_frame_ms)) / 1000;
+            it.print(0, 17, id(font_body), "Telegram RX OK");
+            it.printf(0, 32, id(font_body), "seen %us ago x%d", (unsigned) ago, id(our_frame_count));
+            it.print(0, 47, id(font_body), id(meter_st) == METER_NO_VALUES ? "Decode: need key"
+                                                                            : "Decoding...");
+          } else {
+            it.printf(0, 17, id(font_body), "Imp: %.3f kWh", id(energy_import).state);
+            it.printf(0, 32, id(font_body), "Exp: %.3f kWh", id(energy_export).state);
+            it.printf(0, 47, id(font_body), "P:   %.3f kW",  id(power_import).state);
+          }
+      - id: page_battery
+        lambda: |-
+          it.print(0, 0, id(font_title), "Battery");
+          if (isnan(id(battery_voltage).state)) {
+            it.print(0, 24, id(font_body), "No reading");
+          } else {
+            it.printf(0, 18, id(font_body), "%.2f V", id(battery_voltage).state);
+            // battery_level updates every 30 s vs voltage every 15 s, so it can still
+            // be NaN for one window after boot even when the voltage is valid — guard it.
+            if (!isnan(id(battery_level).state))
+              it.printf(0, 36, id(font_body), "%.0f %%  charge", id(battery_level).state);
+          }
+      # Transient "charging" splash — shown by charging_splash on a detected plug-in
+      # (+127 mV step). Big centered bolt + label. Kept out of the PRG page cycle by
+      # the redirect in prg_button on_press (show_next would otherwise land here).
+      - id: page_charging
+        lambda: |-
+          // Solid lightning bolt (⚡ silhouette), even-odd scanline fill. 6 vertices
+          // in screen px: top stub (66,8)->(66,22), jog out to (78,22), long diagonal
+          // to the tip (62,44), back up the lower edge (62,30)->(50,30), then the
+          // closing diagonal up to the top.
+          static const float vx[6] = {66, 66, 78, 62, 62, 50};
+          static const float vy[6] = { 8, 22, 22, 44, 30, 30};
+          for (int y = 8; y <= 44; y++) {
+            float xs[6]; int n = 0;
+            for (int i = 0; i < 6; i++) {
+              int j = (i + 1) % 6;
+              float y0 = vy[i], y1 = vy[j];
+              if ((y0 <= y && y1 > y) || (y1 <= y && y0 > y))
+                xs[n++] = vx[i] + (y - y0) / (y1 - y0) * (vx[j] - vx[i]);
+            }
+            for (int a = 0; a < n - 1; a++)        // sort intersections by x
+              for (int b = a + 1; b < n; b++)
+                if (xs[b] < xs[a]) { float t = xs[a]; xs[a] = xs[b]; xs[b] = t; }
+            for (int k = 0; k + 1 < n; k += 2) {
+              int xl = (int)(xs[k] + 0.5f);
+              int w  = (int)(xs[k + 1] + 0.5f) - xl;
+              if (w > 0) it.filled_rectangle(xl, y, w, 1);
+            }
+          }
+          it.print(64, 47, id(font_title), TextAlign::TOP_CENTER, "charging");
+
+# Boost the OLED on a PRG press: display_bright_day / display_bright_night for
+# display_bright_time, then back to idle (display_dim by day, off at night).
+script:
+  - id: show_display
+    mode: restart      # another press while boosted restarts the 30 s timer
+    then:
+      - lambda: |-
+          auto now = id(ha_time).now();
+          bool night = now.is_valid() && is_night_hour(now.hour, id(night_start_h).state, id(night_end_h).state);
+          id(oled).set_contrast((night ? id(display_bright_night_pct).state : id(display_bright_day_pct).state) / 100.0f);
+          id(display_awake) = true;
+          id(oled).turn_on();
+      - component.update: oled
+      - delay: !lambda 'return (uint32_t) id(display_bright_time_s).state * 1000;'
+      - lambda: 'id(display_awake) = false;'
+      - script.execute: idle_display
+
+  # Idle rest state: main page at display_dim, always on — except at night,
+  # when the panel goes fully dark (PRG still boosts it). No valid HA time yet
+  # (boot / HA down) counts as day.
+  - id: idle_display
+    mode: restart
+    then:
+      - display.page.show: page_main
+      - lambda: |-
+          auto now = id(ha_time).now();
+          bool night = now.is_valid() && is_night_hour(now.hour, id(night_start_h).state, id(night_end_h).state);
+          // The setup screen stays on at night: someone is setting the board up.
+          bool setup = id(meter_screen) != METER_SCREEN_NONE ||
+                       (!id(meter_ok_seen) && id(link_screen) != LINK_OK);
+          if (night && id(display_night_off).state && !setup) {
+            id(oled).turn_off();
+          } else {
+            id(oled).set_contrast(id(display_dim_pct).state / 100.0f);
+            id(oled).turn_on();
+          }
+      - component.update: oled
+
+interval:
+# Setup screens: the Wi-Fi/HA state and the meter screen latch (status.h).
+  - interval: 1s
+    then:
+      - lambda: |-
+          int screen = meter_screen_next(id(meter_screen), (MeterState) id(meter_st), id(meter_ok_seen));
+          bool provisioning, provisioned, closed;
+          provisioning_status(provisioning, provisioned, closed);
+          int link = link_state(wifi::global_wifi_component->has_sta(),
+                                wifi::global_wifi_component->is_connected(),
+                                wifi_down_timer().down_for(millis()), provisioning, provisioned, closed);
+          if (screen != id(meter_screen) || link != id(link_screen)) {
+            id(meter_screen) = screen;
+            id(link_screen) = link;
+            // At night the idle panel is dark except for a setup screen: apply now.
+            if (!id(display_awake)) id(idle_display).execute();
+          }
+# While idling (not boosted), re-apply the rest state every minute so the panel
+# goes dark at night_start and comes back at night_end without a button press. Also keeps
+# the idle page pinned to main.
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(display_awake);'
+          then:
+            - script.execute: idle_display
+
+# Burn-in shift: cycle the main-page frame through a 2x2 px square. The 1 s
+# display update picks the new offset up automatically.
+  - interval: 3min
+    then:
+      - lambda: |-
+          static uint8_t step = 0;
+          step = (step + 1) % 4;
+          id(idle_shift_x) = (step == 1 || step == 2) ? 1 : 0;
+          id(idle_shift_y) = (step == 2 || step == 3) ? 1 : 0;
+
+# PRG button (GPIO0, strapping pin):
+#   short press      -> boost brightness on the main page; while boosted, advance
+#                       page (main -> status -> meter -> battery -> main) and
+#                       restart the boost timer
+#   long press >=5 s -> power off (deep sleep; press PRG again to power on)
+binary_sensor:
+  - platform: gpio
+    id: prg_button
+    pin:
+      number: GPIO0
+      inverted: true
+      allow_other_uses: true    # also the deep-sleep wakeup pin
+      ignore_strapping_warning: true
+      mode:
+        input: true
+        pullup: true
+    # Debounce GPIO0. Without this, contact bounce on a long hold registers as a
+    # burst of presses (the page rapid-cycles) and keeps resetting the on_click
+    # hold timer, so a 5 s hold never powers off. delayed_off bridges the bounce
+    # gaps so a hold reads as one continuous press; delayed_on rejects on-glitches.
+    filters:
+      - delayed_on: 15ms
+      - delayed_off: 150ms
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(display_awake);'
+          then:
+            # Advance to the next page, but skip the charging splash — it lives in
+            # the pages: list (so charging_splash can show it) but must never appear
+            # in the manual cycle. show_next lands on it after page_battery; redirect.
+            - lambda: |-
+                id(oled).show_next_page();
+                if (id(oled).get_active_page() == id(page_charging))
+                  id(oled).show_page(id(page_main));
+            - component.update: oled
+          else:
+            # First press from idle always lands on the main page (idle_display
+            # already pins it there, but be explicit), then boosts brightness.
+            - display.page.show: page_main
+      - script.execute: show_display
+    on_click:
+      # Fires on release after holding 5-15 s, so the button is no longer pressed
+      # when the chip arms the wake-on-low pin. The display will have woken from
+      # the on_press above - expected; it goes dark again as part of power_off.
+      - min_length: 5s
+        max_length: 15s
+        then:
+          - script.execute: power_off
+
+# --- Settings in Home Assistant ------------------------------------------------
+# Start values come from the substitutions; changes are stored on the board.
+# Night hours and "Display off at night" are visible, the brightness levels are
+# hidden until you enable them on the device page.
+number:
+  - platform: template
+    name: "Night start"
+    id: night_start_h
+    icon: mdi:weather-night
+    entity_category: config
+    unit_of_measurement: "h"
+    min_value: 0
+    max_value: 23
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: ${night_start}
+
+  - platform: template
+    name: "Night end"
+    id: night_end_h
+    icon: mdi:weather-sunset-up
+    entity_category: config
+    unit_of_measurement: "h"
+    min_value: 0
+    max_value: 23
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: ${night_end}
+
+  - platform: template
+    name: "Display dim"
+    id: display_dim_pct
+    icon: mdi:brightness-4
+    entity_category: config
+    disabled_by_default: true
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: ${ display_dim | float * 100 }
+
+  - platform: template
+    name: "Display bright day"
+    id: display_bright_day_pct
+    icon: mdi:brightness-7
+    entity_category: config
+    disabled_by_default: true
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: ${ display_bright_day | float * 100 }
+
+  - platform: template
+    name: "Display bright night"
+    id: display_bright_night_pct
+    icon: mdi:brightness-5
+    entity_category: config
+    disabled_by_default: true
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: ${ display_bright_night | float * 100 }
+
+  - platform: template
+    name: "Display bright time"
+    id: display_bright_time_s
+    icon: mdi:timer-outline
+    entity_category: config
+    disabled_by_default: true
+    unit_of_measurement: "s"
+    min_value: 5
+    max_value: 300
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: ${ display_bright_time | replace('s', '') | int }

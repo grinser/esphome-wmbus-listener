@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host tests (load chart, night hours, status bar)
+        run: tests/run.sh
+
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ESPHome
+        run: pip install esphome==2026.11.0
+      - name: Secrets for the build (placeholders, random API key)
+        run: |
+          key=$(python3 -c 'import secrets,base64;print(base64.b64encode(secrets.token_bytes(32)).decode())')
+          sed "s|REPLACE_WITH_GENERATED_BASE64_KEY=|$key|" secrets.yaml.example > secrets.yaml
+      - name: Validate the config
+        run: esphome config wmbus.yaml > /dev/null
+      - name: Validate the factory config (web installer)
+        run: esphome config wmbus.factory.yaml > /dev/null
+      - name: Compile the firmware
+        run: esphome compile wmbus.yaml

@@ -1,0 +1,574 @@
+# Radio, meter decoder, meter sensors and the telegram LED.
+# The meter address and AES key come from secrets.yaml. Home Assistant can
+# replace both at runtime: the "New meter address" / "New meter key" fields on the
+# device page (saved 60 s after the last valid input), or the "set_meter" action
+# (stored in flash, see "Save a new meter address and key" below).
+
+external_components:
+  # Pinned to an audited commit, not @main: a moving ref would recompile whatever
+  # upstream pushes into firmware that holds our Wi-Fi/API/OTA/AES secrets, with no
+  # review and no reproducibility. Bump this SHA deliberately after skimming the diff.
+  # daf07a9 = SzczepanLeon/esphome-components main as of 2026-11-20 (reviewed: fix
+  # for ESPHome 2026.11, ISR flag init, CC1101-only idle refresh; SX1262 path unchanged).
+  - source: github://SzczepanLeon/esphome-components@daf07a93a77f466b18cfa7bb50d0bd034263d3b3
+    # Whitelist only the wM-Bus components we actually use (socket_transmitter
+    # stays out: unused, it would only widen the attack surface). The repo also bundles an override of the core `esp32` component, which
+    # is stale against current ESPHome (it lacks require_usb_serial_jtag_secondary and
+    # breaks `logger`). Restricting the import makes ESPHome use its own core `esp32`.
+    components: [wmbus_radio, wmbus_meter, wmbus_common]
+
+# --- Radio bus ---------------------------------------------------------------
+spi:
+  clk_pin: GPIO9
+  mosi_pin: GPIO10
+  miso_pin: GPIO11
+
+wmbus_radio:
+  radio_type: SX1262
+  cs_pin: GPIO8         # NSS
+  irq_pin: GPIO14       # DIO1
+  reset_pin: GPIO12
+  busy_pin: GPIO13
+  rf_switch: true       # DIO2 RF switch — required on Heltec V3 (schema default is false; RX is dead silent without it)
+  has_tcxo: true        # DIO3 TCXO — V3 has one (schema default is already true)
+  rx_gain: BOOSTED      # best sensitivity (default)
+  # Note: SX1262 frequency is hardcoded to 868.95 MHz (== wmbus T1). `frequency:` is CC1101-only — do not set it.
+  on_frame:
+    - then:
+        # Track RSSI + counts for the OLED. Also detect frames from our meter by
+        # reading the cleartext data-link address (bytes 4..7, little-endian). This
+        # works before we have the AES key, so the LED blips as soon as the grid
+        # operator activates the customer interface.
+        # Every address heard also goes into the "Meters nearby" list, with the
+        # manufacturer and device type from the same cleartext header.
+        - lambda: |-
+            id(last_rssi) = frame->rssi();
+            id(frame_count) += 1;
+            id(last_frame_ms) = millis();
+            id(our_frame_flag) = false;
+            auto &d = frame->data();
+            if (d.size() >= 8) {
+              char buf[9];
+              snprintf(buf, sizeof(buf), "%02X%02X%02X%02X", d[7], d[6], d[5], d[4]);
+              std::string addr(buf);
+              // Keep the 8 strongest; RSSI rounded to 5 dB so the HA state
+              // changes less often.
+              auto &nearby = id(meters_nearby);
+              int rssi = ((frame->rssi() - 2) / 5) * 5;
+              auto &kind = id(meters_kind);
+              if (!nearby.count(addr) && nearby.size() >= 8) {
+                auto weakest = nearby.begin();
+                for (auto it = nearby.begin(); it != nearby.end(); ++it)
+                  if (it->second < weakest->second) weakest = it;
+                if (weakest->second < rssi) {
+                  kind.erase(weakest->first);
+                  nearby.erase(weakest);
+                }
+              }
+              if (nearby.count(addr) || nearby.size() < 8) {
+                nearby[addr] = rssi;
+                if (d.size() >= 10 && !kind.count(addr))
+                  kind[addr] = wmbus_manufacturer(d[2], d[3]) + " " + wmbus_medium(d[9]);
+              }
+              if (addr == id(meter_addr_active)) {
+                id(our_frame_flag) = true;
+                id(our_frame_count) += 1;
+                id(last_our_frame_ms) = millis();
+                telegram_rate().on_telegram(millis());
+                id(our_rssi) = frame->rssi();
+              }
+            }
+        # Blip the white LED only for our meter's telegram, and redraw the
+        # display at once so the telegram dot in the status bar lights up with it.
+        - if:
+            condition:
+              lambda: 'return id(our_frame_flag);'
+            then:
+              - light.turn_on:
+                  id: rx_led
+                  brightness: !lambda |-
+                    auto now = id(ha_time).now();
+                    bool night = now.is_valid() && is_night_hour(now.hour, id(night_start_h).state, id(night_end_h).state);
+                    return (night ? id(led_night_pct).state : id(led_day_pct).state) / 100.0f;
+                  flash_length: 200ms
+              # Redraw now for the telegram dot, but not while the panel is off.
+              - if:
+                  condition:
+                    lambda: 'return id(oled).is_on();'
+                  then:
+                    - component.update: oled
+        - logger.log:
+            format: "RSSI: %ddBm  T: %s (%d)"
+            args: ["frame->rssi()", "frame->as_hex().c_str()", "frame->data().size()"]
+
+# --- Meter decode ------------------------------------------------------------
+wmbus_meter:
+  - id: electricity_meter
+    meter_id: "0x${meter_id_str}"  # radio link-layer address (from secrets: meter_address)
+    type: amiplus                  # confirmed by a live decrypt (DLL TYPE=02, driver amiplus)
+    key: !secret meter_key         # access code ("Zugangscode") from the grid operator (AES-128, 32 hex chars)
+    mode: T1
+
+globals:
+  - id: last_rssi
+    type: float
+    restore_value: false
+    initial_value: '0'
+
+  - id: frame_count
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  - id: our_frame_count       # frames seen from our meter (cleartext-address match)
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  - id: last_our_frame_ms     # millis() of the last frame from our meter
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  - id: last_frame_ms         # millis() of the last frame from any meter
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  - id: our_rssi              # RSSI of our meter's last frame (status bar bars)
+    type: float
+    restore_value: false
+    initial_value: 'NAN'
+
+  - id: our_frame_flag        # transient: set per-frame when it's from our meter
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # --- Meter setup from Home Assistant ----------------------------------------
+  # Address and key set with the "set_meter" action. Empty = use the values from
+  # secrets.yaml. Stored in flash; the IDs are the storage keys, never rename them.
+  - id: meter_addr_set
+    type: std::string
+    restore_value: true
+    max_restore_data_length: 8
+    initial_value: '""'
+
+  - id: meter_key_set         # write-only: never published to Home Assistant
+    type: std::string
+    restore_value: true
+    max_restore_data_length: 32
+    initial_value: '""'
+
+  - id: meter_addr_active     # address in use (uppercase), for the LED and status
+    type: std::string
+    restore_value: false
+    initial_value: '"${meter_id_str}"'
+
+  - id: meters_nearby         # address -> last RSSI (5 dB steps), the 8 strongest
+    type: std::map<std::string, int>
+    restore_value: false
+
+  - id: meters_kind           # address -> "SAG electricity", same keys as meters_nearby
+    type: std::map<std::string, std::string>
+    restore_value: false
+
+  - id: meter_st              # MeterState (status.h), set every second below
+    type: int
+    restore_value: false
+    initial_value: 'METER_WAITING'
+
+  - id: meter_ok_seen         # OK once since the start: no more setup screen
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: hint_bits             # hints for the main page (hint_mask in status.h)
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  # Typed in the "New meter ..." fields, not yet saved. Never published: the key
+  # field shows only that something was entered.
+  - id: pending_addr
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: pending_key
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: setup_msg             # shown in "Meter status" for a minute (input checks, update)
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: setup_msg_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+# One state for "Meter status" and the display (meter_state in status.h).
+# Values: any meter sensor counts, other meter types may lack a field.
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          static bool grace_over = false;
+          if (millis() >= METER_GRACE_MS) grace_over = true;
+          bool values = id(energy_import).has_state() || id(energy_export).has_state() ||
+                        id(power_import).has_state() || id(power_export).has_state();
+          MeterState st = meter_state(meter_set_up(id(meter_addr_active)), !grace_over, millis(),
+                                      id(frame_count), id(our_frame_count),
+                                      id(last_our_frame_ms), values);
+          if (st == METER_OK) id(meter_ok_seen) = true;
+          id(meter_st) = st;
+          // A setup message (wrong format, saved) replaces the state for a minute.
+          std::string text = meter_state_text(st);
+          if (id(autosave_meter).is_running()) {
+            // Count down to the save (autosave_meter, 60 s) in 10 s steps, so the
+            // Home Assistant history gets six states, not sixty.
+            int left = 60 - (int) ((millis() - id(setup_msg_ms)) / 1000);
+            int shown = (left + 9) / 10 * 10;
+            text = "Saving in " + to_string(shown < 10 ? 10 : shown) + " s. Enter the key if it is new.";
+          } else if (!id(setup_msg).empty()) {
+            if (millis() - id(setup_msg_ms) < 60000) text = id(setup_msg);
+            else id(setup_msg) = "";
+          }
+          if (!id(meter_status_text).has_state() || id(meter_status_text).state != text)
+            id(meter_status_text).publish_state(text);
+          // Hints for the main page. The telegram hints only after the meter
+          // was OK once; before that, the setup screen says what is missing.
+          // The HA clock runs only while Wi-Fi is up, so "HA offline" does not
+          // follow "Wi-Fi offline" while the API reconnects.
+          uint32_t now = millis();
+          bool wifi_up = wifi::global_wifi_component->is_connected();
+          wifi_down_timer().update(wifi_up, now);
+          ha_down_timer().update(!wifi_up || api::global_api_server->is_connected(), now);
+          bool ok = id(meter_ok_seen);
+          id(hint_bits) = hint_mask(wifi_down_timer().down_for(now) > HINT_DOWN_MS,
+                                    wifi_up && ha_down_timer().down_for(now) > HINT_DOWN_MS,
+                                    ok && now - id(last_our_frame_ms) > HINT_SILENT_MS,
+                                    ok && telegram_rate().few());
+  - interval: 60s
+    then:
+      - lambda: |-
+          telegram_rate().end_minute();
+          float tpm = telegram_rate().per_minute();
+          if (!isnan(tpm)) id(telegrams_per_min).publish_state(tpm);
+
+# Before the first telegram (loop starts after setup), replace the compiled
+# address and key with the stored ones. Priority 750: after globals restore
+# their values (800), before the radio delivers frames.
+esphome:
+  on_boot:
+    - priority: 750
+      then:
+        - lambda: |-
+            // The decoder lower-cases the address itself; the LED and the status
+            // compare upper case, so normalise a lower-case secret here.
+            id(meter_addr_active) = str_upper_case(id(meter_addr_active));
+            std::string addr = id(meter_addr_set);
+            std::string key = id(meter_key_set);
+            // Check the stored values again: flash can hold anything.
+            if (!addr.empty() && !is_hex_len(addr, 8)) {
+              ESP_LOGW("meter", "Stored meter address is invalid, using secrets.yaml");
+              addr = "";
+            }
+            if (!key.empty() && !is_hex_len(key, 32)) {
+              ESP_LOGW("meter", "Stored meter key is invalid, using secrets.yaml");
+              key = "";
+            }
+            if (addr.empty() && key.empty())
+              return;  // keep the values from secrets.yaml
+            if (addr.empty())
+              addr = id(meter_addr_active);  // the secrets.yaml address, upper case
+            if (key.empty()) {
+              key = id(electricity_meter)->get_key();
+              if (key == "not-encrypted" || key == "unknown")
+                key = "";
+            }
+            id(electricity_meter)->set_meter_params(str_lower_case(addr), id(electricity_meter)->get_driver(),
+                                                    key, {LinkMode::T1});
+            id(meter_addr_active) = str_upper_case(addr);
+            ESP_LOGI("meter", "Meter 0x%s: address/key from Home Assistant", id(meter_addr_active).c_str());
+
+# Save a new meter address and key: from the fields (autosave below) or the
+# set_meter action. 8 and 32 hex digits; spaces, '-', ':' and "0x" are ignored
+# (clean_hex_input in settings.h). An empty field keeps the value from
+# secrets.yaml; both empty goes back to secrets.yaml entirely. A wrong format
+# shows in "Meter status" for a minute and changes nothing. The board stores the
+# values and restarts.
+script:
+  - id: save_meter
+    parameters:
+      address: string
+      key: string
+    then:
+      - lambda: |-
+          auto fail = [](const char *msg) {
+            ESP_LOGW("meter", "%s, nothing changed", msg);
+            id(setup_msg) = msg;
+            id(setup_msg_ms) = millis();
+          };
+          std::string new_addr = clean_hex_input(address);
+          std::string new_key = str_lower_case(clean_hex_input(key));
+          if (!new_addr.empty() && !is_hex_len(new_addr, 8)) {
+            fail("Address must be 8 hex characters");
+            return;
+          }
+          if (!new_key.empty() && !is_hex_len(new_key, 32)) {
+            fail("Key must be 32 hex characters");
+            return;
+          }
+          if (new_addr == id(meter_addr_set) && new_key == id(meter_key_set)) {
+            ESP_LOGI("meter", "Meter: same values, no restart");
+            id(setup_msg) = "Same values, nothing to save";
+            id(setup_msg_ms) = millis();
+            return;  // an automation calling it at every start must not loop
+          }
+          id(meter_addr_set) = new_addr;
+          id(meter_key_set) = new_key;
+          id(pending_addr) = "";
+          id(pending_key) = "";
+          ESP_LOGI("meter", "Meter: stored, restarting");
+          id(meter_status_text).publish_state("Saved, restarting");
+          App.safe_reboot();  // on_shutdown writes the globals to flash first
+
+  # The fields save by themselves: 60 s after the last valid input, so the key
+  # can follow the address with one restart. An empty field keeps what is stored
+  # now (unlike set_meter). Every new input starts the 60 s again.
+  - id: autosave_meter
+    mode: restart
+    then:
+      - lambda: |-
+          id(setup_msg) = "";
+          id(setup_msg_ms) = millis();  // start of the countdown in "Meter status"
+      - delay: 60s
+      - script.execute:
+          id: save_meter
+          address: !lambda 'return id(pending_addr).empty() ? id(meter_addr_set) : id(pending_addr);'
+          key: !lambda 'return id(pending_key).empty() ? id(meter_key_set) : id(pending_key);'
+
+  # Called by both fields after an input. A wrong format in either field shows
+  # at once and stops a pending save; both fields empty cancel it; otherwise
+  # (re)start the 60 s.
+  - id: meter_input_changed
+    then:
+      - lambda: |-
+          const std::string &a = id(pending_addr), &k = id(pending_key);
+          const char *bad = !a.empty() && !is_hex_len(a, 8)  ? "Address must be 8 hex characters"
+                          : !k.empty() && !is_hex_len(k, 32) ? "Key must be 32 hex characters"
+                                                             : "";
+          if (*bad || (a.empty() && k.empty())) {
+            id(autosave_meter).stop();
+            id(setup_msg) = bad;
+            id(setup_msg_ms) = millis();
+            if (*bad) ESP_LOGW("meter", "%s, nothing saved", bad);
+          } else {
+            id(autosave_meter).execute();
+          }
+
+api:
+  actions:
+    - action: set_meter
+      variables:
+        address: string
+        key: string
+      then:
+        - script.execute:
+            id: save_meter
+            address: !lambda 'return address;'
+            key: !lambda 'return key;'
+
+# Fields on the device page (Configuration). The key field never shows the key.
+# A valid input saves by itself after 60 s (autosave_meter above).
+text:
+  - platform: template
+    name: "New meter address"
+    id: new_meter_address
+    icon: mdi:identifier
+    entity_category: config
+    mode: text
+    min_length: 0
+    max_length: 20
+    lambda: 'return id(pending_addr);'
+    update_interval: never
+    set_action:
+      - lambda: |-
+          id(pending_addr) = clean_hex_input(x);
+          id(new_meter_address).publish_state(id(pending_addr));
+      - script.execute: meter_input_changed
+
+  - platform: template
+    name: "New meter key"
+    id: new_meter_key
+    icon: mdi:key
+    entity_category: config
+    mode: password
+    min_length: 0
+    max_length: 64
+    lambda: 'return std::string(id(pending_key).empty() ? "" : "entered");'
+    update_interval: never
+    set_action:
+      - lambda: |-
+          id(pending_key) = clean_hex_input(x);
+          id(new_meter_key).publish_state(id(pending_key).empty() ? "" : "entered");
+      - script.execute: meter_input_changed
+
+# LED brightness per telegram, 0 % = off. Start values: led_day / led_night.
+number:
+  - platform: template
+    name: "LED day"
+    id: led_day_pct
+    icon: mdi:led-on
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: ${ led_day | float * 100 }
+
+  - platform: template
+    name: "LED night"
+    id: led_night_pct
+    icon: mdi:led-on
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: ${ led_night | float * 100 }
+
+button:
+  - platform: template
+    name: "Scan for meters"
+    icon: mdi:radar
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(meters_nearby).clear();
+          id(meters_kind).clear();
+
+text_sensor:
+  - platform: template
+    name: "Meter status"
+    id: meter_status_text
+    icon: mdi:meter-electric
+    entity_category: diagnostic
+    update_interval: never     # published on change by the 1 s interval above
+
+  - platform: template
+    name: "Meter address"
+    icon: mdi:identifier
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(meter_addr_active);'
+
+  # "0A1B2C3D SAG electricity -71 dBm, ..." sorted by signal, strongest first.
+  # Home Assistant keeps at most 255 characters, so the weakest may be left out.
+  - platform: template
+    name: "Meters nearby"
+    icon: mdi:radar
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: |-
+      std::vector<std::pair<int, std::string>> list;
+      for (auto &e : id(meters_nearby)) list.push_back({e.second, e.first});
+      std::sort(list.begin(), list.end(), [](auto &a, auto &b) { return a.first > b.first; });
+      std::string out;
+      for (auto &e : list) {
+        std::string item = e.second;
+        auto k = id(meters_kind).find(e.second);
+        if (k != id(meters_kind).end()) item += " " + k->second;
+        item += " " + to_string(e.first) + " dBm";
+        if (out.size() + item.size() + 2 > 255) break;
+        if (!out.empty()) out += ", ";
+        out += item;
+      }
+      return out.empty() ? std::string("none yet") : out;
+
+# White onboard LED (GPIO35). Blips when our meter's telegram is received.
+output:
+  - platform: ledc        # PWM so the blip brightness is adjustable
+    pin: GPIO35
+    id: led_output
+
+light:
+  # monochromatic (PWM) so the RX blip can be dimmed. The blip
+  # brightness follows the same day/night pattern as the OLED (see the turn_on
+  # calls): low at night so it won't flash brightly in a dark room, normal by day.
+  - platform: monochromatic
+    id: rx_led
+    output: led_output
+    internal: true            # driven by automation, not a user-facing entity
+
+# --- Sensors -----------------------------------------------------------------
+sensor:
+  # Our telegrams per minute, average over the last 10 minutes. Shows a weak spot
+  # over days.
+  - platform: template
+    name: "Telegrams per minute"
+    id: telegrams_per_min
+    icon: mdi:radio-tower
+    entity_category: diagnostic
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never     # published at the end of each minute above
+
+  # field: names are the amiplus driver's identifiers, confirmed on the NES meter.
+  # For another meter, check them with a local `wmbusmeters --analyze` (docs/setup.md, step 3).
+  - platform: wmbus_meter
+    parent_id: electricity_meter
+    field: total_energy_consumption_kwh
+    id: energy_import
+    name: "Energy Import"
+    device_class: energy
+    state_class: total_increasing
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+
+  - platform: wmbus_meter
+    parent_id: electricity_meter
+    field: total_energy_production_kwh
+    id: energy_export
+    name: "Energy Export"
+    device_class: energy
+    state_class: total_increasing
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+
+  - platform: wmbus_meter
+    parent_id: electricity_meter
+    field: current_power_consumption_kw    # OBIS 1.7.0 - Momentane Wirkleistung Bezug
+    id: power_import
+    name: "Power Import"
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: kW
+    accuracy_decimals: 3
+
+  - platform: wmbus_meter
+    parent_id: electricity_meter
+    field: current_power_production_kw      # OBIS 2.7.0 - Momentane Wirkleistung Lieferung
+    id: power_export                         # (export/feed-in; 0 W without PV, but the meter sends it)
+    name: "Power Export"
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: kW
+    accuracy_decimals: 3
+
+  - platform: wmbus_meter
+    parent_id: electricity_meter
+    field: rssi_dbm
+    name: "wM-Bus RSSI"
+    device_class: signal_strength
+    state_class: measurement
+    unit_of_measurement: dBm
+    entity_category: diagnostic

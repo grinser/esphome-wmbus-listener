@@ -1,0 +1,25 @@
+# Recipe 1: hot water running
+#
+# For homes with an electric instantaneous water heater. The heater only runs
+# while hot water flows, and it draws 11-23 kW. In the tested apartment, all
+# other loads stayed below 2.4 kW 99% of the time. Above 8 kW, a hot tap is
+# open. An oven plus a dishwasher or washing machine that heats stays below.
+#
+# Change the 8 kW threshold for your home. Look at a day of Power Import first.
+#
+# The sensor stays "on" for 60 seconds after the power drops. This bridges lost
+# messages and short pauses, for example while you use soap.
+#
+# Needs: meter_reporting.yaml
+
+template:
+  - binary_sensor:
+      - name: "Hot water running"
+        unique_id: wmbus_hot_water_running
+        state: >-
+          {{ states('sensor.wm_bus_meter_power_import') | float(0) > 8
+             and is_state('binary_sensor.meter_reporting', 'on') }}
+        availability: >-
+          {{ has_value('sensor.wm_bus_meter_power_import')
+             and is_state('binary_sensor.meter_reporting', 'on') }}
+        delay_off: "00:01:00"

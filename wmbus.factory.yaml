@@ -1,0 +1,71 @@
+# Factory firmware for the web installer: the same firmware as wmbus.yaml, but
+# without any personal value compiled in. CI builds it for every release.
+#
+# - Wi-Fi: entered in the browser right after flashing (Improv Serial over USB).
+#   No hotspot and no OTA over the network: nobody in Wi-Fi or radio range can
+#   reflash the board or read the keys it stores.
+# - API key: none. Home Assistant sets one when you add the device; the board
+#   stores it in flash (only a factory reset removes it). The provisioning window
+#   closes 30 minutes after a start; power-cycle the board to open it again.
+# - Meter address and key: set in Home Assistant with the set_meter action.
+# - Updates: from GitHub releases ("Firmware" update entity).
+#
+# You do not need this file to build your own firmware: use wmbus.yaml or
+# device-builder.yaml.
+
+packages:
+  base: !include wmbus.yaml
+
+substitutions:
+  meter_id_str: "00000000"        # "Not set up" until set_meter runs
+  # Where the "Firmware" update entity looks for new releases. Release candidates
+  # point this at a test manifest (docs/releasing.md); releases keep the default.
+  update_manifest_url: https://grinser.github.io/esphome-wmbus-listener/firmware/wmbus-listener.manifest.json
+
+esphome:
+  name_add_mac_suffix: true       # several boards in one network
+  project:
+    name: grinser.wmbus-listener
+    version: dev                  # replaced with the release version by CI
+
+dashboard_import:
+  # Adopting in the Device Builder: the device gets this file's settings from GitHub.
+  package_import_url: github://grinser/esphome-wmbus-listener/device-builder.yaml@stable
+  import_full_config: false
+
+wifi:
+  ssid: !remove
+  password: !remove
+
+improv_serial:
+
+# Until Home Assistant has set the API key (and Improv the Wi-Fi), anyone in the
+# network could claim the board. Close that window 30 minutes after each start.
+provisioning:
+  timeout: 30min
+
+api:
+  encryption:
+    key: !remove                  # Home Assistant provides the key on adoption
+
+http_request:
+
+ota:
+  # No device OTA: without a key at build time it would accept unencrypted
+  # uploads from anyone in the network. Updates come from GitHub releases
+  # (http_request, HTTPS); moving to the Device Builder needs one USB install.
+  - id: !remove ota_esphome
+  - platform: http_request
+    # A broken download leaves the old firmware running and Home Assistant shows
+    # no error, only "Install" again. Say it in "Meter status" for a minute.
+    on_error:
+      then:
+        - lambda: |-
+            id(setup_msg) = "Update failed, try again";
+            id(setup_msg_ms) = millis();
+
+update:
+  - platform: http_request
+    name: "Firmware"
+    source: ${update_manifest_url}
+    update_interval: 24h
