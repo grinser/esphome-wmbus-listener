@@ -8,7 +8,7 @@ wiring to the meter, no cloud service, and no electrician.
 
 <img src="docs/display.png" width="512" alt="The display: radio signal of the meter, Wi-Fi, time and battery at the top, current power and today's energy in the middle, the day's load chart at the bottom, the current quarter hour on the right">
 
-- **Top row:** signal of your meter (4 bars; the dot lights up for each of its messages, a hollow dot means only other meters in
+- **Top row:** signal of your meter (4 bars; the dot in the top-left corner lights up for each of its messages, a hollow dot means only other meters in
   the last minute, an X means nothing at all), Wi-Fi (dotted arcs are missing strength, all dotted means no connection), time, battery.
 - **Middle:** current power and the energy used today.
 - **Bottom:** today in quarter-hour bars, from midnight on the left to the marker below the current bar. The dotted bars
