@@ -12,6 +12,14 @@ to GitHub Pages and moves the `stable` branch, which Device Builder users load.
 
 Before a major or minor release, run the release-candidate test below first.
 
+## Repository setup (once)
+
+A new copy of the repository needs two settings before its first release:
+
+- **Settings → Pages:** source **GitHub Actions**.
+- **Settings → Environments → github-pages:** add a deployment rule for tags `v*`. By default the environment only
+  accepts deployments from `main`, and the release workflow runs on the tag, so the Pages job fails without it.
+
 ## Release-candidate test
 
 Run it on a real board, against a Home Assistant you use every day if you have no test instance. A spare board shows
