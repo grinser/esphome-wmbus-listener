@@ -90,7 +90,8 @@ page ([details](docs/web-installer.md)). **With an AI assistant:** give it
 
 `wmbus.yaml` includes the packages from this repository; `device-builder.yaml` loads the same packages from GitHub, with
 the same settings. `tests/run.sh` runs host tests for the load chart, the night hours and the status bar, and checks
-that both files carry the same settings. CI runs the tests and compiles the firmware with ESPHome 2026.11.0 on every push.
+that both files carry the same settings. CI runs the tests and compiles the firmware with ESPHome 2026.11.0 on every
+push.
 
 ## Credits
 
